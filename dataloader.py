@@ -42,7 +42,6 @@ class PairedDataset(Dataset):
 def create_dataloaders(train_low, train_high, test_low, test_high, crop_size=256, batch_size=1):
     transform = transforms.Compose([
         transforms.ToTensor(),
-        # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     train_loader = None
     test_loader = None

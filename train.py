@@ -14,41 +14,30 @@ from datetime import datetime
 from measure import metrics
 from tqdm import tqdm
 
-# def validate(model, dataloader, device, result_dir):
-#     model.eval()
-#     with torch.no_grad():
-#         for idx, (low, high) in enumerate(dataloader):
-#             low, high = low.to(device), high.to(device)
-#             output = model(low)
-#             output = torch.clamp(output, 0, 1)
-
-#             # Save the output image
-#             save_image(output, os.path.join(result_dir, f'{idx}.png'))
-
 def validate(model, dataloader, device, result_dir):
     model.eval()
     with torch.no_grad():
-        for low, high, name in dataloader:  # 解包三個值
+        for low, high, name in dataloader:
             low, high = low.to(device), high.to(device)
             output = model(low)
             output = torch.clamp(output, 0, 1)
 
-            # 使用原始圖片名稱保存輸出圖片
-            # name 是一個 batch 的名稱列表，這裡假設 batch_size=1，所以取 name[0]
-            save_image(output, os.path.join(result_dir, f'{name[0]}.png'))
+            filename = name[0] if not name[0].endswith('.png') else name[0]
+            save_path = os.path.join(result_dir, filename)
+            save_image(output, save_path)
 
 def main():
     # Hyperparameters
     train_low = 'data/LOLv1/Train/input'
     train_high = 'data/LOLv1/Train/target'
     test_low = 'data/LOLv1/Test/input'
-    test_high = 'data/LOLv1/Test/target'
+    test_high = 'data/LOLv1/Test/target/'
     learning_rate = 2e-4 
     num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'LR: {learning_rate}; Epochs: {num_epochs}')
 
-    result_dir = '/content/drive/MyDrive/Att-UNet/results/output'
+    result_dir = '/content/drive/MyDrive/Att-UNet/results/output/'
 
     # Data loaders
     train_loader, test_loader = create_dataloaders(train_low, train_high, test_low, test_high, crop_size=256, batch_size=1)
@@ -70,8 +59,7 @@ def main():
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
-        # for batch_idx, batch in enumerate(train_loader):
-            # inputs, targets = batch
+
         for batch_idx, (inputs, targets, _) in enumerate(train_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 

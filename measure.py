@@ -68,17 +68,16 @@ def metrics(im_dir, label_dir, use_GT_mean):
     loss_fn = lpips.LPIPS(net='alex')
     loss_fn.cuda()
     for item in tqdm(sorted(glob.glob(im_dir))):
-        n += 1
+        name = os.path.basename(item)
+
+        if name.endswith('.png.png'):
+            continue
         
+        n += 1
         im1 = Image.open(item).convert('RGB') 
         
-        os_name = platform.system()
-        if os_name.lower() == 'windows':
-            name = item.split('\\')[-1]
-        elif os_name.lower() == 'linux':
-            name = item.split('/')[-1]
-        else:
-            name = item.split('/')[-1]
+        if not label_dir.endswith('/'):
+            label_dir += '/'
             
         im2 = Image.open(label_dir + name).convert('RGB')
         (h, w) = im2.size

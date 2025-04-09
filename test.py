@@ -29,7 +29,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     dataset_name = test_low.split('/')[1]
-    result_dir = '/content/drive/MyDrive/Att-UNet/results/testing/output'
+    result_dir = '/content/drive/MyDrive/Att-UNet/results/testing/output/'
 
     _, test_loader = create_dataloaders(None, None, test_low, test_high, crop_size=None, batch_size=1)
     print(f'Test loader: {len(test_loader)}')
