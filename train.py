@@ -12,16 +12,30 @@ import os
 import numpy as np
 from datetime import datetime
 from measure import metrics
+from tqdm import tqdm
+
+# def validate(model, dataloader, device, result_dir):
+#     model.eval()
+#     with torch.no_grad():
+#         for idx, (low, high) in enumerate(dataloader):
+#             low, high = low.to(device), high.to(device)
+#             output = model(low)
+#             output = torch.clamp(output, 0, 1)
+
+#             # Save the output image
+#             save_image(output, os.path.join(result_dir, f'{idx}.png'))
 
 def validate(model, dataloader, device, result_dir):
     model.eval()
     with torch.no_grad():
-        for idx, (low, high) in enumerate(dataloader):
+        for low, high, name in dataloader:  # 解包三個值
             low, high = low.to(device), high.to(device)
             output = model(low)
+            output = torch.clamp(output, 0, 1)
 
-            # Save the output image
-            save_image(output, os.path.join(result_dir, f'{idx}.png'))
+            # 使用原始圖片名稱保存輸出圖片
+            # name 是一個 batch 的名稱列表，這裡假設 batch_size=1，所以取 name[0]
+            save_image(output, os.path.join(result_dir, f'{name[0]}.png'))
 
 def main():
     # Hyperparameters
@@ -56,8 +70,9 @@ def main():
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
-        for batch_idx, batch in enumerate(train_loader):
-            inputs, targets = batch
+        # for batch_idx, batch in enumerate(train_loader):
+            # inputs, targets = batch
+        for batch_idx, (inputs, targets, _) in enumerate(train_loader):
             inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad()
@@ -74,7 +89,7 @@ def main():
         avg_train_loss = train_loss / len(train_loader)
 
         validate(model, test_loader, device, result_dir)
-        avg_psnr, avg_ssim, avg_lpips = metrics(result_dir, test_high, use_GT_mean=True)
+        avg_psnr, avg_ssim, avg_lpips = metrics(result_dir + '*.png', test_high, use_GT_mean=True)
         
         current_lr = optimizer.param_groups[0]['lr']
         print(f'Epoch {epoch + 1}/{num_epochs}, LR: {current_lr:.4f}, Loss: {avg_train_loss:.4f}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f}')

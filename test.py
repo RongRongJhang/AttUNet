@@ -16,6 +16,7 @@ def validate(model, dataloader, device, result_dir):
         for idx, (low, high) in enumerate(dataloader):
             low, high = low.to(device), high.to(device)
             output = model(low)
+            output = torch.clamp(output, 0, 1)
 
             # Save the output image
             save_image(output, os.path.join(result_dir, f'{idx}.png'))
@@ -38,7 +39,7 @@ def main():
     print(f'Model loaded from {weights_path}')
 
     validate(model, test_loader, device, result_dir)
-    avg_psnr, avg_ssim, avg_lpips = metrics(result_dir, test_high, use_GT_mean=True)
+    avg_psnr, avg_ssim, avg_lpips = metrics(result_dir + '*.png', test_high, use_GT_mean=True)
 
     print(f'Validation PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f}')
 

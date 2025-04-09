@@ -36,7 +36,8 @@ class PairedDataset(Dataset):
             low_image = transforms.functional.crop(low_image, i, j, h, w)
             high_image = transforms.functional.crop(high_image, i, j, h, w)
 
-        return low_image, high_image
+        # 返回低光圖片名稱
+        return low_image, high_image, self.low_images[idx]
 
 def create_dataloaders(train_low, train_high, test_low, test_high, crop_size=256, batch_size=1):
     transform = transforms.Compose([
