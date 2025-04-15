@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
-from ecb import ECB
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -104,13 +103,12 @@ class Denoiser(nn.Module):
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
-        # 替換 refine 層為 ECB
-        self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.refine4 = nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1)
+        self.refine3 = nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1)
+        self.refine2 = nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        self.up4 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
         self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
         self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
@@ -123,11 +121,11 @@ class Denoiser(nn.Module):
         x4 = self.activation(self.conv4(x3))
         x = self.bottleneck(x4)
         x = self.up4(x)
-        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
+        x = self.refine4(self.activation(x + x3))
         x = self.up3(x)
-        x = self.refine3(x + x2)
+        x = self.refine3(self.activation(x + x2))
         x = self.up2(x)
-        x = self.refine2(x + x1)
+        x = self.refine2(self.activation(x + x1))
         x = self.res_layer(x)
         return torch.tanh(self.output_layer(x + x))
     
