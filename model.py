@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import math
 from ecb import ECB
+from HVI_transform import RGB_HVI
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -149,16 +150,16 @@ class LYT(nn.Module):
         self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
-        self.msef = MSEFBlock(filters)  # 使用改進後的 MSEFBlock
+        self.msef = MSEFBlock(filters)
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
-        self.final_refine = nn.Conv2d(filters, filters, kernel_size=3, padding=1)
+        self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
+        self.trans = RGB_HVI()
         self._init_weights()
 
     def _create_processing_layers(self, filters):
         return nn.Sequential(
-            nn.Conv2d(1, filters, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
+            ECB(inp_planes=1, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False),
         )
     
     def _rgb_to_ycbcr(self, image):
@@ -183,10 +184,16 @@ class LYT(nn.Module):
         b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
         oklab = torch.stack((L, a, b_out), dim=1)
         return oklab
+    
+    def HVIT(self,image):
+        hvi = self.trans.HVIT(image)
+        return hvi
 
     def forward(self, inputs):
-        ycbcr = self._rgb_to_oklab(inputs)
-        y, cb, cr = torch.split(ycbcr, 1, dim=1)
+        # ycbcr = self._rgb_to_oklab(inputs)
+        hvi = self.trans.HVIT(inputs)
+        # y, cb, cr = torch.split(ycbcr, 1, dim=1)
+        cb, cr, y = torch.split(hvi, 1, dim=1)
         cbcr = torch.cat([cb, cr], dim=1)
         cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
         cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
