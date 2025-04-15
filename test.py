@@ -13,13 +13,14 @@ from measure import metrics
 def validate(model, dataloader, device, result_dir):
     model.eval()
     with torch.no_grad():
-        for idx, (low, high) in enumerate(dataloader):
+        for low, high, name in dataloader:
             low, high = low.to(device), high.to(device)
             output = model(low)
             output = torch.clamp(output, 0, 1)
 
-            # Save the output image
-            save_image(output, os.path.join(result_dir, f'{idx}.png'))
+            filename = name[0] if not name[0].endswith('.png') else name[0]
+            save_path = os.path.join(result_dir, filename)
+            save_image(output, save_path)
 
 def main():
     # Paths and device setup
