@@ -46,7 +46,8 @@ def main():
     # Model, loss, optimizer, and scheduler
     model = LYT().to(device)
 
-    criterion = CombinedLoss(device, total_epochs=num_epochs).to(device)
+    # criterion = CombinedLoss(device, total_epochs=num_epochs).to(device)
+    criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
     scaler = torch.amp.GradScaler('cuda')
@@ -58,7 +59,7 @@ def main():
     print('Training started.')
     for epoch in range(num_epochs):
 
-        criterion.set_epoch(epoch)  # 在每個 epoch 開始時更新權重
+        # criterion.set_epoch(epoch)  # 在每個 epoch 開始時更新權重
         model.train()
         train_loss = 0.0
 

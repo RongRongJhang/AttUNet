@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
 
-# 修改 SeqConv3x3 以添加初始化邏輯
 class SeqConv3x3(nn.Module):
     def __init__(self, seq_type, inp_planes, out_planes, depth_multiplier):
         super(SeqConv3x3, self).__init__()
@@ -30,6 +28,9 @@ class SeqConv3x3(nn.Module):
             # init scale & bias
             scale = torch.randn(size=(self.out_planes, 1, 1, 1)) * 1e-3
             self.scale = nn.Parameter(scale)
+            # bias = 0.0
+            # bias = [bias for c in range(self.out_planes)]
+            # bias = torch.FloatTensor(bias)
             bias = torch.randn(self.out_planes) * 1e-3
             bias = torch.reshape(bias, (self.out_planes,))
             self.bias = nn.Parameter(bias)
@@ -51,10 +52,13 @@ class SeqConv3x3(nn.Module):
 
             # init scale & bias
             scale = torch.randn(size=(self.out_planes, 1, 1, 1)) * 1e-3
-            self.scale = nn.Parameter(scale)
+            self.scale = nn.Parameter(torch.FloatTensor(scale))
+            # bias = 0.0
+            # bias = [bias for c in range(self.out_planes)]
+            # bias = torch.FloatTensor(bias)
             bias = torch.randn(self.out_planes) * 1e-3
             bias = torch.reshape(bias, (self.out_planes,))
-            self.bias = nn.Parameter(bias)
+            self.bias = nn.Parameter(torch.FloatTensor(bias))
             # init mask
             self.mask = torch.zeros((self.out_planes, 1, 3, 3), dtype=torch.float32)
             for i in range(self.out_planes):
@@ -73,10 +77,13 @@ class SeqConv3x3(nn.Module):
 
             # init scale & bias
             scale = torch.randn(size=(self.out_planes, 1, 1, 1)) * 1e-3
-            self.scale = nn.Parameter(scale)
+            self.scale = nn.Parameter(torch.FloatTensor(scale))
+            # bias = 0.0
+            # bias = [bias for c in range(self.out_planes)]
+            # bias = torch.FloatTensor(bias)
             bias = torch.randn(self.out_planes) * 1e-3
             bias = torch.reshape(bias, (self.out_planes,))
-            self.bias = nn.Parameter(bias)
+            self.bias = nn.Parameter(torch.FloatTensor(bias))
             # init mask
             self.mask = torch.zeros((self.out_planes, 1, 3, 3), dtype=torch.float32)
             for i in range(self.out_planes):
@@ -89,26 +96,29 @@ class SeqConv3x3(nn.Module):
         else:
             raise ValueError('the type of seqconv is not supported!')
 
-        self._init_weights()
-
     def forward(self, x):
         if self.type == 'conv1x1-conv3x3':
+            # conv-1x1
             y0 = F.conv2d(input=x, weight=self.k0, bias=self.b0, stride=1)
+            # explicitly padding with bias
             y0 = F.pad(y0, (1, 1, 1, 1), 'constant', 0)
             b0_pad = self.b0.view(1, -1, 1, 1)
             y0[:, :, 0:1, :] = b0_pad
             y0[:, :, -1:, :] = b0_pad
             y0[:, :, :, 0:1] = b0_pad
             y0[:, :, :, -1:] = b0_pad
+            # conv-3x3
             y1 = F.conv2d(input=y0, weight=self.k1, bias=self.b1, stride=1)
         else:
             y0 = F.conv2d(input=x, weight=self.k0, bias=self.b0, stride=1)
+            # explicitly padding with bias
             y0 = F.pad(y0, (1, 1, 1, 1), 'constant', 0)
             b0_pad = self.b0.view(1, -1, 1, 1)
             y0[:, :, 0:1, :] = b0_pad
             y0[:, :, -1:, :] = b0_pad
             y0[:, :, :, 0:1] = b0_pad
             y0[:, :, :, -1:] = b0_pad
+            # conv-3x3
             y1 = F.conv2d(input=y0, weight=self.scale * self.mask, bias=self.bias, stride=1, groups=self.out_planes)
         return y1
     
@@ -118,7 +128,9 @@ class SeqConv3x3(nn.Module):
             device = None
 
         if self.type == 'conv1x1-conv3x3':
+            # re-param conv kernel
             RK = F.conv2d(input=self.k1, weight=self.k0.permute(1, 0, 2, 3))
+            # re-param conv bias
             RB = torch.ones(1, self.mid_planes, 3, 3, device=device) * self.b0.view(1, -1, 1, 1)
             RB = F.conv2d(input=RB, weight=self.k1).view(-1,) + self.b1
         else:
@@ -127,30 +139,17 @@ class SeqConv3x3(nn.Module):
             for i in range(self.out_planes):
                 k1[i, i, :, :] = tmp[i, 0, :, :]
             b1 = self.bias
+            # re-param conv kernel
             RK = F.conv2d(input=k1, weight=self.k0.permute(1, 0, 2, 3))
+            # re-param conv bias
             RB = torch.ones(1, self.out_planes, 3, 3, device=device) * self.b0.view(1, -1, 1, 1)
             RB = F.conv2d(input=RB, weight=k1).view(-1,) + b1
         return RK, RB
 
-    def _init_weights(self):
-        # 初始化可訓練的卷積層
-        if self.type == 'conv1x1-conv3x3':
-            init.kaiming_uniform_(self.k0, a=0, mode='fan_in', nonlinearity='relu')
-            init.kaiming_uniform_(self.k1, a=0, mode='fan_in', nonlinearity='relu')
-            if self.b0 is not None:
-                init.constant_(self.b0, 0)
-            if self.b1 is not None:
-                init.constant_(self.b1, 0)
-        else:
-            init.kaiming_uniform_(self.k0, a=0, mode='fan_in', nonlinearity='relu')
-            if self.b0 is not None:
-                init.constant_(self.b0, 0)
-            # scale 和 bias 已在上方初始化為小隨機值，保持不變
-            # mask 是固定濾波器，不需要初始化
 
-# 修改 ECB 以添加初始化邏輯
+
 class ECB(nn.Module):
-    def __init__(self, inp_planes, out_planes, depth_multiplier, act_type='relu', with_idt=False):
+    def __init__(self, inp_planes, out_planes, depth_multiplier, act_type='prelu', with_idt = False):
         super(ECB, self).__init__()
 
         self.depth_multiplier = depth_multiplier
@@ -169,10 +168,10 @@ class ECB(nn.Module):
         self.conv1x1_sby = SeqConv3x3('conv1x1-sobely', self.inp_planes, self.out_planes, -1)
         self.conv1x1_lpl = SeqConv3x3('conv1x1-laplacian', self.inp_planes, self.out_planes, -1)
 
-        if self.act_type == 'relu':
-            self.act = nn.ReLU(inplace=True)
-        elif self.act_type == 'prelu':
+        if self.act_type == 'prelu':
             self.act = nn.PReLU(num_parameters=self.out_planes)
+        elif self.act_type == 'relu':
+            self.act = nn.ReLU(inplace=True)
         elif self.act_type == 'rrelu':
             self.act = nn.RReLU(lower=-0.05, upper=0.05)
         elif self.act_type == 'softplus':
@@ -180,13 +179,11 @@ class ECB(nn.Module):
         elif self.act_type == 'linear':
             pass
         else:
-            raise ValueError('The type of activation is not supported!')
-
-        self._init_weights()
+            raise ValueError('The type of activation if not support!')
 
     def forward(self, x):
         if self.training:
-            y = self.conv3x3(x) + \
+            y = self.conv3x3(x)     + \
                 self.conv1x1_3x3(x) + \
                 self.conv1x1_sbx(x) + \
                 self.conv1x1_sby(x) + \
@@ -206,7 +203,7 @@ class ECB(nn.Module):
         K2, B2 = self.conv1x1_sbx.rep_params()
         K3, B3 = self.conv1x1_sby.rep_params()
         K4, B4 = self.conv1x1_lpl.rep_params()
-        RK, RB = (K0 + K1 + K2 + K3 + K4), (B0 + B1 + B2 + B3 + B4)
+        RK, RB = (K0+K1+K2+K3+K4), (B0+B1+B2+B3+B4)
 
         if self.with_idt:
             device = RK.get_device()
@@ -218,9 +215,3 @@ class ECB(nn.Module):
             B_idt = 0.0
             RK, RB = RK + K_idt, RB + B_idt
         return RK, RB
-
-    def _init_weights(self):
-        # 初始化 conv3x3
-        init.kaiming_uniform_(self.conv3x3.weight, a=0, mode='fan_in', nonlinearity='relu')
-        if self.conv3x3.bias is not None:
-            init.constant_(self.conv3x3.bias, 0)

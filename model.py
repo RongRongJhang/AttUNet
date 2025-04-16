@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
-from ecb import ECB, SeqConv3x3
+from ecb import ECB
 
 class EfficientAttention(nn.Module):
     def __init__(self, in_channels, key_channels=2, head_count=2, value_channels=2):
@@ -43,9 +43,9 @@ class EfficientAttention(nn.Module):
 
     def _init_weights(self):
         for layer in [self.keys, self.queries, self.values, self.reprojection]:
-            init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
+            nn.init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
             if layer.bias is not None:
-                init.constant_(layer.bias, 0)
+                nn.init.constant_(layer.bias, 0)
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -53,25 +53,29 @@ class LayerNormalization(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
+        # Rearrange the tensor for LayerNorm (B, C, H, W) to (B, H, W, C)
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
+        # Rearrange back to (B, C, H, W)
         return x.permute(0, 3, 1, 2)
 
 class ECABlock(nn.Module):
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 動態計算卷積核大小
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1  # 確保為奇數
+        # 修正：輸入和輸出通道數應為 channels，而不是 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
                               padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
         batch_size, channels, _, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels, 1)
-        y = self.conv(y)
-        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
+        y = self.avg_pool(x).view(batch_size, channels, 1)  # (B, C, 1)
+        y = self.conv(y)  # (B, C, 1)
+        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)  # (B, C, 1, 1)
         return x * y
 
     def _init_weights(self):
@@ -81,16 +85,22 @@ class MSEFBlock(nn.Module):
     def __init__(self, filters):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
-        self.depthwise_conv = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False)
-        self.se_attn = ECABlock(filters)
+        self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
+        # 將 SEBlock 替換為 ECABlock
+        self.se_attn = ECABlock(filters)  # 修改這一行，使用 ECABlock 代替 SEBlock
+        self._init_weights()
 
     def forward(self, x):
         x_norm = self.layer_norm(x)
         x1 = self.depthwise_conv(x_norm)
-        x2 = self.se_attn(x_norm)
+        x2 = self.se_attn(x_norm)  # 使用 ECABlock
         x_fused = x1 * x2
         x_out = x_fused + x
         return x_out
+    
+    def _init_weights(self):
+        init.kaiming_uniform_(self.depthwise_conv.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.constant_(self.depthwise_conv.bias, 0)
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_size, num_heads):
@@ -112,13 +122,17 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(self, x):
         batch_size, _, height, width = x.size()
         x = x.reshape(batch_size, height * width, -1)
+
         query = self.split_heads(self.query_dense(x), batch_size)
         key = self.split_heads(self.key_dense(x), batch_size)
         value = self.split_heads(self.value_dense(x), batch_size)
+        
         attention_weights = F.softmax(torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim ** 0.5), dim=-1)
         attention = torch.matmul(attention_weights, value)
         attention = attention.permute(0, 2, 1, 3).contiguous().reshape(batch_size, -1, self.embed_size)
+        
         output = self.combine_heads(attention)
+        
         return output.reshape(batch_size, height, width, self.embed_size).permute(0, 3, 1, 2)
 
     def _init_weights(self):
@@ -138,15 +152,19 @@ class Denoiser(nn.Module):
         self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        
         self.bottleneck_y = EfficientAttention(in_channels=num_filters // 3)
         self.bottleneck_cb = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
         self.bottleneck_cr = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
+        
+        # 替換 refine 層為 ECB
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.up4 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.output_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
         self.res_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
@@ -157,13 +175,17 @@ class Denoiser(nn.Module):
         x2 = self.activation(self.conv2(x1))
         x3 = self.activation(self.conv3(x2))
         x4 = self.activation(self.conv4(x3))
+        
         y, cb, cr = torch.split(x4, x4.size(1) // 3, dim=1)
+        
         y_processed = self.bottleneck_y(y)
         cb_processed = self.bottleneck_cb(cb)
         cr_processed = self.bottleneck_cr(cr)
+        
         x = torch.cat([y_processed, cb_processed, cr_processed], dim=1)
+        
         x = self.up4(x)
-        x = self.refine4(x + x3)
+        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
         x = self.up3(x)
         x = self.refine3(x + x2)
         x = self.up2(x)
@@ -226,34 +248,28 @@ class LYT(nn.Module):
         denoised_ycbcr = self.denoiser(ycbcr)
         denoised_ycbcr = self.denoiser_out_conv(denoised_ycbcr) + ycbcr
         y, cb, cr = torch.split(denoised_ycbcr, 1, dim=1)
+
         y_processed = self.process_y(y)
         cb_processed = self.process_cb(cb)
         cr_processed = self.process_cr(cr)
+
         ref = torch.cat([cb_processed, cr_processed], dim=1)
         lum = y_processed
+
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
         ref = self.msef(ref)
         ref = ref + shortcut
+
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
-        refined = self.final_refine(recombined)  # 移除 F.relu，因為 ECB 內部已包含 ReLU
+        refined = self.final_refine(F.relu(recombined))
         output = self.final_adjustments(refined)
         return torch.sigmoid(output)
     
     def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
+        for module in self.children():
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Linear):
-                init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    init.constant_(module.bias, 0)
-            elif isinstance(module, SeqConv3x3):
-                # SeqConv3x3 內部已處理初始化，這裡跳過以避免重複
-                pass
-            elif isinstance(module, ECB):
-                # ECB 內部已處理初始化，這裡跳過以避免重複
-                pass
