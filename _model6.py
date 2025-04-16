@@ -5,31 +5,77 @@ import torch.nn.init as init
 import math
 from ecb import ECB
 
+class EfficientAttention(nn.Module):
+    def __init__(self, in_channels, key_channels=2, head_count=2, value_channels=2):
+        super().__init__()
+        self.in_channels = in_channels
+        self.key_channels = key_channels
+        self.head_count = head_count
+        self.value_channels = value_channels
+
+        self.keys = nn.Conv2d(in_channels, key_channels, 1)
+        self.queries = nn.Conv2d(in_channels, key_channels, 1)
+        self.values = nn.Conv2d(in_channels, value_channels, 1)
+        self.reprojection = nn.Conv2d(value_channels, in_channels, 1)
+        self._init_weights()
+
+    def forward(self, input_):
+        n, _, h, w = input_.size()
+        keys = self.keys(input_).reshape((n, self.key_channels, h * w))
+        queries = self.queries(input_).reshape(n, self.key_channels, h * w)
+        values = self.values(input_).reshape((n, self.value_channels, h * w))
+        head_key_channels = self.key_channels // self.head_count
+        head_value_channels = self.value_channels // self.head_count
+
+        attended_values = []
+        for i in range(self.head_count):
+            key = F.softmax(keys[:, i * head_key_channels:(i + 1) * head_key_channels, :], dim=2)
+            query = F.softmax(queries[:, i * head_key_channels:(i + 1) * head_key_channels, :], dim=1)
+            value = values[:, i * head_value_channels:(i + 1) * head_value_channels, :]
+            context = key @ value.transpose(1, 2)
+            attended_value = (context.transpose(1, 2) @ query).reshape(n, head_value_channels, h, w)
+            attended_values.append(attended_value)
+
+        aggregated_values = torch.cat(attended_values, dim=1)
+        reprojected_value = self.reprojection(aggregated_values)
+        attention = reprojected_value + input_
+        return attention
+
+    def _init_weights(self):
+        for layer in [self.keys, self.queries, self.values, self.reprojection]:
+            nn.init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
+
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
+        # Rearrange the tensor for LayerNorm (B, C, H, W) to (B, H, W, C)
         x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
+        # Rearrange back to (B, C, H, W)
         return x.permute(0, 3, 1, 2)
 
 class ECABlock(nn.Module):
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 動態計算卷積核大小
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1  # 確保為奇數
+        # 修正：輸入和輸出通道數應為 channels，而不是 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
                               padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
         batch_size, channels, _, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels, 1)
-        y = self.conv(y)
-        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
+        y = self.avg_pool(x).view(batch_size, channels, 1)  # (B, C, 1)
+        y = self.conv(y)  # (B, C, 1)
+        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)  # (B, C, 1, 1)
         return x * y
 
     def _init_weights(self):
@@ -40,13 +86,14 @@ class MSEFBlock(nn.Module):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
         self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)
+        # 將 SEBlock 替換為 ECABlock
+        self.se_attn = ECABlock(filters)  # 修改這一行，使用 ECABlock 代替 SEBlock
         self._init_weights()
 
     def forward(self, x):
         x_norm = self.layer_norm(x)
         x1 = self.depthwise_conv(x_norm)
-        x2 = self.eca_attn(x_norm)
+        x2 = self.se_attn(x_norm)  # 使用 ECABlock
         x_fused = x1 * x2
         x_out = x_fused + x
         return x_out
@@ -75,13 +122,17 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(self, x):
         batch_size, _, height, width = x.size()
         x = x.reshape(batch_size, height * width, -1)
+
         query = self.split_heads(self.query_dense(x), batch_size)
         key = self.split_heads(self.key_dense(x), batch_size)
         value = self.split_heads(self.value_dense(x), batch_size)
+        
         attention_weights = F.softmax(torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim ** 0.5), dim=-1)
         attention = torch.matmul(attention_weights, value)
         attention = attention.permute(0, 2, 1, 3).contiguous().reshape(batch_size, -1, self.embed_size)
+        
         output = self.combine_heads(attention)
+        
         return output.reshape(batch_size, height, width, self.embed_size).permute(0, 3, 1, 2)
 
     def _init_weights(self):
@@ -97,19 +148,25 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = nn.Conv2d(2, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv1 = nn.Conv2d(3, num_filters, kernel_size=kernel_size, padding=1)
         self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
+        
+        self.bottleneck_y = EfficientAttention(in_channels=num_filters // 3)
+        self.bottleneck_cb = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
+        self.bottleneck_cr = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
+        
+        # 替換 refine 層為 ECB
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.up4 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
-        self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
+        
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.output_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
+        self.res_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
         self._init_weights()
 
@@ -118,15 +175,23 @@ class Denoiser(nn.Module):
         x2 = self.activation(self.conv2(x1))
         x3 = self.activation(self.conv3(x2))
         x4 = self.activation(self.conv4(x3))
-        x = self.bottleneck(x4)
+        
+        y, cb, cr = torch.split(x4, x4.size(1) // 3, dim=1)
+        
+        y_processed = self.bottleneck_y(y)
+        cb_processed = self.bottleneck_cb(cb)
+        cr_processed = self.bottleneck_cr(cr)
+        
+        x = torch.cat([y_processed, cb_processed, cr_processed], dim=1)
+        
         x = self.up4(x)
-        x = self.refine4(x + x3)
+        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
         x = self.up3(x)
         x = self.refine3(x + x2)
         x = self.up2(x)
         x = self.refine2(x + x1)
         x = self.res_layer(x)
-        return torch.tanh(self.output_layer(x + x))
+        return torch.tanh(self.output_layer(x))
     
     def _init_weights(self):
         for layer in [self.conv1, self.conv2, self.conv3, self.conv4, self.output_layer, self.res_layer]:
@@ -134,62 +199,35 @@ class Denoiser(nn.Module):
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
 
-class ECBSR(nn.Module):
-    def __init__(self, module_nums, channel_nums, with_idt, act_type, scale, colors):
-        super(ECBSR, self).__init__()
-        self.module_nums = module_nums
-        self.channel_nums = channel_nums
-        self.scale = scale
-        self.colors = colors
-        self.with_idt = with_idt
-        self.act_type = act_type
-        self.backbone = None
-        self.upsampler = None
-
-        backbone = []
-        backbone += [ECB(self.colors, self.channel_nums, depth_multiplier=2.0, act_type=self.act_type, with_idt=self.with_idt)]
-        for i in range(self.module_nums):
-            backbone += [ECB(self.channel_nums, self.channel_nums, depth_multiplier=2.0, act_type=self.act_type, with_idt=self.with_idt)]
-        backbone += [ECB(self.channel_nums, self.colors * self.scale * self.scale, depth_multiplier=2.0, act_type='linear', with_idt=self.with_idt)]
-
-        self.backbone = nn.Sequential(*backbone)
-        self.upsampler = nn.PixelShuffle(self.scale)
-    
-    def forward(self, x):
-        y = self.backbone(x) + x
-        y = self.upsampler(y)
-        return y
-
 class LYT(nn.Module):
     def __init__(self, filters=48):
         super(LYT, self).__init__()
         self.process_y = self._create_processing_layers(filters)
         self.process_cb = self._create_processing_layers(filters)
         self.process_cr = self._create_processing_layers(filters)
-        self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
-        self.lum_pool = nn.MaxPool2d(8)
-        self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
-        self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
+        self.denoiser = Denoiser(filters // 2)
+        self.denoiser_out_conv = nn.Conv2d(filters // 2, 3, kernel_size=3, padding=1)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
-        # 替換 final_refine 和 final_adjustments 為 ECBSR
-        self.final_ecbsr = ECBSR(
-            module_nums=2,           # 使用 2 個中間 ECB 模組
-            channel_nums=filters,    # 中間通道數與 filters 一致
-            with_idt=True,           # 保留殞差連繫
-            act_type='relu',         # 與模型其他部分一致
-            scale=1,                 # 無需上採樣
-            colors=filters           # 輸入通道為 filters，輸出為 3（由 backbone 控制）
-        )
+        self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
+        self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
         self._init_weights()
     
     def _create_processing_layers(self, filters):
         return nn.Sequential(
             ECB(inp_planes=1, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False),
         )
-        
+    
+    def _rgb_to_ycbcr(self, image):
+        r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        u = -0.14713 * r - 0.28886 * g + 0.436 * b + 0.5
+        v = 0.615 * r - 0.51499 * g - 0.10001 * b + 0.5
+        yuv = torch.stack((y, u, v), dim=1)
+        return yuv
+    
     def _rgb_to_oklab(self, image):
         r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
         l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
@@ -207,34 +245,31 @@ class LYT(nn.Module):
 
     def forward(self, inputs):
         ycbcr = self._rgb_to_oklab(inputs)
-        y, cb, cr = torch.split(ycbcr, 1, dim=1)
-        cbcr = torch.cat([cb, cr], dim=1)
-        cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
-        cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
+        denoised_ycbcr = self.denoiser(ycbcr)
+        denoised_ycbcr = self.denoiser_out_conv(denoised_ycbcr) + ycbcr
+        y, cb, cr = torch.split(denoised_ycbcr, 1, dim=1)
+
         y_processed = self.process_y(y)
-        cb_processed = self.process_cb(cb_denoised)
-        cr_processed = self.process_cr(cr_denoised)
+        cb_processed = self.process_cb(cb)
+        cr_processed = self.process_cr(cr)
+
         ref = torch.cat([cb_processed, cr_processed], dim=1)
         lum = y_processed
-        lum_1 = self.lum_pool(lum)
-        lum_1 = self.lum_mhsa(lum_1)
-        lum_1 = self.lum_up(lum_1)
-        lum = lum + lum_1
+
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
         ref = self.msef(ref)
         ref = ref + shortcut
+
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
-        output = self.final_ecbsr(recombined)  # 直接使用 ECBSR 輸出，無需額外 ReLU
+        refined = self.final_refine(F.relu(recombined))
+        output = self.final_adjustments(refined)
         return torch.sigmoid(output)
     
     def _init_weights(self):
-        for module in self.modules():
+        for module in self.children():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     init.constant_(module.bias, 0)
-            elif isinstance(module, ECBSR):
-                # ECBSR 內部已處理初始化，跳過
-                pass
