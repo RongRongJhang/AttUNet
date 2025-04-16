@@ -3,8 +3,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
-from ecb import ECB
-from HVI_transform import RGB_HVI
+from ecb import ECB, SeqConv3x3
+
+class EfficientAttention(nn.Module):
+    def __init__(self, in_channels, key_channels=2, head_count=2, value_channels=2):
+        super().__init__()
+        self.in_channels = in_channels
+        self.key_channels = key_channels
+        self.head_count = head_count
+        self.value_channels = value_channels
+
+        self.keys = nn.Conv2d(in_channels, key_channels, 1)
+        self.queries = nn.Conv2d(in_channels, key_channels, 1)
+        self.values = nn.Conv2d(in_channels, value_channels, 1)
+        self.reprojection = nn.Conv2d(value_channels, in_channels, 1)
+        self._init_weights()
+
+    def forward(self, input_):
+        n, _, h, w = input_.size()
+        keys = self.keys(input_).reshape((n, self.key_channels, h * w))
+        queries = self.queries(input_).reshape(n, self.key_channels, h * w)
+        values = self.values(input_).reshape((n, self.value_channels, h * w))
+        head_key_channels = self.key_channels // self.head_count
+        head_value_channels = self.value_channels // self.head_count
+
+        attended_values = []
+        for i in range(self.head_count):
+            key = F.softmax(keys[:, i * head_key_channels:(i + 1) * head_key_channels, :], dim=2)
+            query = F.softmax(queries[:, i * head_key_channels:(i + 1) * head_key_channels, :], dim=1)
+            value = values[:, i * head_value_channels:(i + 1) * head_value_channels, :]
+            context = key @ value.transpose(1, 2)
+            attended_value = (context.transpose(1, 2) @ query).reshape(n, head_value_channels, h, w)
+            attended_values.append(attended_value)
+
+        aggregated_values = torch.cat(attended_values, dim=1)
+        reprojected_value = self.reprojection(aggregated_values)
+        attention = reprojected_value + input_
+        return attention
+
+    def _init_weights(self):
+        for layer in [self.keys, self.queries, self.values, self.reprojection]:
+            init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
+            if layer.bias is not None:
+                init.constant_(layer.bias, 0)
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -20,19 +61,17 @@ class ECABlock(nn.Module):
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # 動態計算卷積核大小
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1  # 確保為奇數
-        # 修正：輸入和輸出通道數應為 channels，而不是 1
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
                               padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
         batch_size, channels, _, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels, 1)  # (B, C, 1)
-        y = self.conv(y)  # (B, C, 1)
-        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)  # (B, C, 1, 1)
+        y = self.avg_pool(x).view(batch_size, channels, 1)
+        y = self.conv(y)
+        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
         return x * y
 
     def _init_weights(self):
@@ -42,21 +81,16 @@ class MSEFBlock(nn.Module):
     def __init__(self, filters):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
-        self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)  # 使用修正後的 ECABlock
-        self._init_weights()
+        self.depthwise_conv = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False)
+        self.se_attn = ECABlock(filters)
 
     def forward(self, x):
         x_norm = self.layer_norm(x)
         x1 = self.depthwise_conv(x_norm)
-        x2 = self.eca_attn(x_norm)
+        x2 = self.se_attn(x_norm)
         x_fused = x1 * x2
         x_out = x_fused + x
         return x_out
-    
-    def _init_weights(self):
-        init.kaiming_uniform_(self.depthwise_conv.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.constant_(self.depthwise_conv.bias, 0)
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_size, num_heads):
@@ -100,20 +134,21 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = nn.Conv2d(2, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv1 = nn.Conv2d(3, num_filters, kernel_size=kernel_size, padding=1)
         self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
-        # 替換 refine 層為 ECB
+        self.bottleneck_y = EfficientAttention(in_channels=num_filters // 3)
+        self.bottleneck_cb = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
+        self.bottleneck_cr = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
-        self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        self.up4 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
+        self.output_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
+        self.res_layer = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
         self._init_weights()
 
@@ -122,15 +157,19 @@ class Denoiser(nn.Module):
         x2 = self.activation(self.conv2(x1))
         x3 = self.activation(self.conv3(x2))
         x4 = self.activation(self.conv4(x3))
-        x = self.bottleneck(x4)
+        y, cb, cr = torch.split(x4, x4.size(1) // 3, dim=1)
+        y_processed = self.bottleneck_y(y)
+        cb_processed = self.bottleneck_cb(cb)
+        cr_processed = self.bottleneck_cr(cr)
+        x = torch.cat([y_processed, cb_processed, cr_processed], dim=1)
         x = self.up4(x)
-        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
+        x = self.refine4(x + x3)
         x = self.up3(x)
         x = self.refine3(x + x2)
         x = self.up2(x)
         x = self.refine2(x + x1)
         x = self.res_layer(x)
-        return torch.tanh(self.output_layer(x + x))
+        return torch.tanh(self.output_layer(x))
     
     def _init_weights(self):
         for layer in [self.conv1, self.conv2, self.conv3, self.conv4, self.output_layer, self.res_layer]:
@@ -144,19 +183,16 @@ class LYT(nn.Module):
         self.process_y = self._create_processing_layers(filters)
         self.process_cb = self._create_processing_layers(filters)
         self.process_cr = self._create_processing_layers(filters)
-        self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
-        self.lum_pool = nn.MaxPool2d(8)
-        self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
-        self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
+        self.denoiser = Denoiser(filters // 2)
+        self.denoiser_out_conv = nn.Conv2d(filters // 2, 3, kernel_size=3, padding=1)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
-        self.trans = RGB_HVI()
         self._init_weights()
-
+    
     def _create_processing_layers(self, filters):
         return nn.Sequential(
             ECB(inp_planes=1, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False),
@@ -184,41 +220,40 @@ class LYT(nn.Module):
         b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
         oklab = torch.stack((L, a, b_out), dim=1)
         return oklab
-    
-    def HVIT(self,image):
-        hvi = self.trans.HVIT(image)
-        return hvi
 
     def forward(self, inputs):
-        # ycbcr = self._rgb_to_oklab(inputs)
-        hvi = self.trans.HVIT(inputs)
-        # y, cb, cr = torch.split(ycbcr, 1, dim=1)
-        cb, cr, y = torch.split(hvi, 1, dim=1)
-        cbcr = torch.cat([cb, cr], dim=1)
-        cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
-        cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
+        ycbcr = self._rgb_to_oklab(inputs)
+        denoised_ycbcr = self.denoiser(ycbcr)
+        denoised_ycbcr = self.denoiser_out_conv(denoised_ycbcr) + ycbcr
+        y, cb, cr = torch.split(denoised_ycbcr, 1, dim=1)
         y_processed = self.process_y(y)
-        cb_processed = self.process_cb(cb_denoised)
-        cr_processed = self.process_cr(cr_denoised)
+        cb_processed = self.process_cb(cb)
+        cr_processed = self.process_cr(cr)
         ref = torch.cat([cb_processed, cr_processed], dim=1)
         lum = y_processed
-        lum_1 = self.lum_pool(lum)
-        lum_1 = self.lum_mhsa(lum_1)
-        lum_1 = self.lum_up(lum_1)
-        lum = lum + lum_1
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
         ref = self.msef(ref)
         ref = ref + shortcut
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
-        refined = self.final_refine(F.relu(recombined))
+        refined = self.final_refine(recombined)  # 移除 F.relu，因為 ECB 內部已包含 ReLU
         output = self.final_adjustments(refined)
         return torch.sigmoid(output)
     
     def _init_weights(self):
-        for module in self.children():
-            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Linear):
+                init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    init.constant_(module.bias, 0)
+            elif isinstance(module, SeqConv3x3):
+                # SeqConv3x3 內部已處理初始化，這裡跳過以避免重複
+                pass
+            elif isinstance(module, ECB):
+                # ECB 內部已處理初始化，這裡跳過以避免重複
+                pass
