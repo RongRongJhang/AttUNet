@@ -137,36 +137,6 @@ class Denoiser(nn.Module):
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
 
-class EdgeSR_TR_MultiChannel(nn.Module):
-    def __init__(self, model_id, in_channels, out_channels, stride=2):
-        super().__init__()
-        self.model_id = model_id
-        assert self.model_id.startswith('eSR-TR_')
-        parse = self.model_id.split('_')
-        self.channels = out_channels
-        self.kernel_size = (int([s for s in parse if s.startswith('K')][0][1:]), ) * 2
-        self.stride = (stride, ) * 2
-        self.pixel_shuffle = nn.PixelShuffle(self.stride[0])
-        self.softmax = nn.Softmax(dim=1)
-        self.filter = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=3*self.stride[0]*self.stride[1]*self.channels,
-            kernel_size=self.kernel_size,
-            stride=1,
-            padding=((self.kernel_size[0]-1)//2, (self.kernel_size[1]-1)//2),
-            groups=1,
-            bias=False,
-            dilation=1
-        )
-        nn.init.xavier_normal_(self.filter.weight, gain=1.)
-        for c in range(in_channels):
-            self.filter.weight.data[:, c, self.kernel_size[0]//2, self.kernel_size[0]//2] = 1.
-
-    def forward(self, input):
-        filtered = self.pixel_shuffle(self.filter(input))
-        value, query, key = torch.split(filtered, [self.channels, self.channels, self.channels], dim=1)
-        return torch.sum(value * self.softmax(query*key), dim=1, keepdim=True)
-
 class LYT(nn.Module):
     def __init__(self, filters=48):
         super(LYT, self).__init__()
@@ -176,9 +146,7 @@ class LYT(nn.Module):
         self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
         self.lum_pool = nn.MaxPool2d(8)
         self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
-        # 使用級聯的 edgeSR_TR 實現 8× 放大
-        self.lum_up1 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s4', in_channels=filters, out_channels=filters, stride=4)
-        self.lum_up2 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s2', in_channels=1, out_channels=filters, stride=2)
+        self.lum_up = nn.Upsample(scale_factor=8, mode='bicubic', align_corners=True)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
@@ -220,8 +188,7 @@ class LYT(nn.Module):
         lum = y_processed
         lum_1 = self.lum_pool(lum)
         lum_1 = self.lum_mhsa(lum_1)
-        lum_1 = self.lum_up1(lum_1)  # 4× 放大，輸出 [batch_size, 1, H/2, W/2]
-        lum_1 = self.lum_up2(lum_1)  # 2× 放大，輸出 [batch_size, filters, H, W]
+        lum_1 = self.lum_up(lum_1)
         lum = lum + lum_1
         ref = self.ref_conv(ref)
         shortcut = ref

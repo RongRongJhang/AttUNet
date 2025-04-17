@@ -19,19 +19,17 @@ class ECABlock(nn.Module):
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # 動態計算卷積核大小
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1  # 確保為奇數
-        # 修正：輸入和輸出通道數應為 channels，而不是 1
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
                               padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
         batch_size, channels, _, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels, 1)  # (B, C, 1)
-        y = self.conv(y)  # (B, C, 1)
-        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)  # (B, C, 1, 1)
+        y = self.avg_pool(x).view(batch_size, channels, 1)
+        y = self.conv(y)
+        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
         return x * y
 
     def _init_weights(self):
@@ -42,7 +40,7 @@ class MSEFBlock(nn.Module):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
         self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)  # 使用修正後的 ECABlock
+        self.eca_attn = ECABlock(filters)
         self._init_weights()
 
     def forward(self, x):
@@ -104,7 +102,6 @@ class Denoiser(nn.Module):
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
-        # 替換 refine 層為 ECB
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
@@ -123,7 +120,7 @@ class Denoiser(nn.Module):
         x4 = self.activation(self.conv4(x3))
         x = self.bottleneck(x4)
         x = self.up4(x)
-        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
+        x = self.refine4(x + x3)
         x = self.up3(x)
         x = self.refine3(x + x2)
         x = self.up2(x)
@@ -137,35 +134,32 @@ class Denoiser(nn.Module):
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
 
-class EdgeSR_TR_MultiChannel(nn.Module):
-    def __init__(self, model_id, in_channels, out_channels, stride=2):
-        super().__init__()
-        self.model_id = model_id
-        assert self.model_id.startswith('eSR-TR_')
-        parse = self.model_id.split('_')
-        self.channels = out_channels
-        self.kernel_size = (int([s for s in parse if s.startswith('K')][0][1:]), ) * 2
-        self.stride = (stride, ) * 2
-        self.pixel_shuffle = nn.PixelShuffle(self.stride[0])
-        self.softmax = nn.Softmax(dim=1)
-        self.filter = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=3*self.stride[0]*self.stride[1]*self.channels,
-            kernel_size=self.kernel_size,
-            stride=1,
-            padding=((self.kernel_size[0]-1)//2, (self.kernel_size[1]-1)//2),
-            groups=1,
-            bias=False,
-            dilation=1
-        )
-        nn.init.xavier_normal_(self.filter.weight, gain=1.)
-        for c in range(in_channels):
-            self.filter.weight.data[:, c, self.kernel_size[0]//2, self.kernel_size[0]//2] = 1.
+class ECBSR(nn.Module):
+    def __init__(self, module_nums, channel_nums, with_idt, act_type, scale, colors, out_channels=3):
+        super(ECBSR, self).__init__()
+        self.module_nums = module_nums
+        self.channel_nums = channel_nums
+        self.scale = scale
+        self.colors = colors
+        self.out_channels = out_channels
+        self.with_idt = with_idt
+        self.act_type = act_type
+        self.backbone = None
+        self.upsampler = None
 
-    def forward(self, input):
-        filtered = self.pixel_shuffle(self.filter(input))
-        value, query, key = torch.split(filtered, [self.channels, self.channels, self.channels], dim=1)
-        return torch.sum(value * self.softmax(query*key), dim=1, keepdim=True)
+        backbone = []
+        backbone += [ECB(self.colors, self.channel_nums, depth_multiplier=2.0, act_type=self.act_type, with_idt=self.with_idt)]
+        for i in range(self.module_nums):
+            backbone += [ECB(self.channel_nums, self.channel_nums, depth_multiplier=2.0, act_type=self.act_type, with_idt=self.with_idt)]
+        backbone += [ECB(self.channel_nums, self.out_channels * self.scale * self.scale, depth_multiplier=2.0, act_type='linear', with_idt=self.with_idt)]
+
+        self.backbone = nn.Sequential(*backbone)
+        self.upsampler = nn.PixelShuffle(self.scale)
+    
+    def forward(self, x):
+        y = self.backbone(x)  # 移除殞差連繫，因為輸入和輸出通道數不同
+        y = self.upsampler(y)
+        return y
 
 class LYT(nn.Module):
     def __init__(self, filters=48):
@@ -176,15 +170,20 @@ class LYT(nn.Module):
         self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
         self.lum_pool = nn.MaxPool2d(8)
         self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
-        # 使用級聯的 edgeSR_TR 實現 8× 放大
-        self.lum_up1 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s4', in_channels=filters, out_channels=filters, stride=4)
-        self.lum_up2 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s2', in_channels=1, out_channels=filters, stride=2)
+        self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
-        self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
+        self.final_ecbsr = ECBSR(
+            module_nums=2,
+            channel_nums=filters,
+            with_idt=True,
+            act_type='relu',
+            scale=1,
+            colors=filters,
+            out_channels=3
+        )
         self._init_weights()
 
     def _create_processing_layers(self, filters):
@@ -220,8 +219,7 @@ class LYT(nn.Module):
         lum = y_processed
         lum_1 = self.lum_pool(lum)
         lum_1 = self.lum_mhsa(lum_1)
-        lum_1 = self.lum_up1(lum_1)  # 4× 放大，輸出 [batch_size, 1, H/2, W/2]
-        lum_1 = self.lum_up2(lum_1)  # 2× 放大，輸出 [batch_size, filters, H, W]
+        lum_1 = self.lum_up(lum_1)
         lum = lum + lum_1
         ref = self.ref_conv(ref)
         shortcut = ref
@@ -229,13 +227,14 @@ class LYT(nn.Module):
         ref = self.msef(ref)
         ref = ref + shortcut
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
-        refined = self.final_refine(F.relu(recombined))
-        output = self.final_adjustments(refined)
+        output = self.final_ecbsr(recombined)
         return torch.sigmoid(output)
     
     def _init_weights(self):
-        for module in self.children():
+        for module in self.modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     init.constant_(module.bias, 0)
+            elif isinstance(module, ECBSR):
+                pass
