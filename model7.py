@@ -5,26 +5,6 @@ import torch.nn.init as init
 import math
 from ecb import ECB
 
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        self._init_weights()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return torch.sigmoid(out) * x
-
-    def _init_weights(self):
-        init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.kaiming_uniform_(self.fc2.weight, a=0, mode='fan_in', nonlinearity='relu')
-
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()
@@ -57,14 +37,12 @@ class ECABlock(nn.Module):
     def _init_weights(self):
         init.kaiming_uniform_(self.conv.weight, a=0, mode='fan_in', nonlinearity='relu')
 
-# 修改MSEFBlock以包含通道注意力
 class MSEFBlock(nn.Module):
     def __init__(self, filters):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
         self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)
-        self.channel_attn = ChannelAttention(filters)  # 新增通道注意力
+        self.eca_attn = ECABlock(filters)  # 使用修正後的 ECABlock
         self._init_weights()
 
     def forward(self, x):
@@ -72,7 +50,6 @@ class MSEFBlock(nn.Module):
         x1 = self.depthwise_conv(x_norm)
         x2 = self.eca_attn(x_norm)
         x_fused = x1 * x2
-        x_fused = self.channel_attn(x_fused)  # 應用通道注意力
         x_out = x_fused + x
         return x_out
     
@@ -160,21 +137,35 @@ class Denoiser(nn.Module):
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
 
-# 添加顏色平衡模塊
-class ColorBalance(nn.Module):
-    def __init__(self, channels):
-        super(ColorBalance, self).__init__()
-        self.adjust = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
-        self._init_weights()
+class EdgeSR_TR_MultiChannel(nn.Module):
+    def __init__(self, model_id, in_channels, out_channels, stride=2):
+        super().__init__()
+        self.model_id = model_id
+        assert self.model_id.startswith('eSR-TR_')
+        parse = self.model_id.split('_')
+        self.channels = out_channels
+        self.kernel_size = (int([s for s in parse if s.startswith('K')][0][1:]), ) * 2
+        self.stride = (stride, ) * 2
+        self.pixel_shuffle = nn.PixelShuffle(self.stride[0])
+        self.softmax = nn.Softmax(dim=1)
+        self.filter = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=3*self.stride[0]*self.stride[1]*self.channels,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=((self.kernel_size[0]-1)//2, (self.kernel_size[1]-1)//2),
+            groups=1,
+            bias=False,
+            dilation=1
+        )
+        nn.init.xavier_normal_(self.filter.weight, gain=1.)
+        for c in range(in_channels):
+            self.filter.weight.data[:, c, self.kernel_size[0]//2, self.kernel_size[0]//2] = 1.
 
-    def forward(self, x):
-        # 自適應調整每個通道的權重
-        weights = torch.sigmoid(self.adjust(x))
-        return x * weights
-
-    def _init_weights(self):
-        init.kaiming_uniform_(self.adjust.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.constant_(self.adjust.bias, 0)
+    def forward(self, input):
+        filtered = self.pixel_shuffle(self.filter(input))
+        value, query, key = torch.split(filtered, [self.channels, self.channels, self.channels], dim=1)
+        return torch.sum(value * self.softmax(query*key), dim=1, keepdim=True)
 
 class LYT(nn.Module):
     def __init__(self, filters=48):
@@ -185,11 +176,12 @@ class LYT(nn.Module):
         self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
         self.lum_pool = nn.MaxPool2d(8)
         self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
-        self.lum_up = nn.Upsample(scale_factor=8, mode='bicubic', align_corners=True)
+        # 使用級聯的 edgeSR_TR 實現 8× 放大
+        self.lum_up1 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s4', in_channels=filters, out_channels=filters, stride=4)
+        self.lum_up2 = EdgeSR_TR_MultiChannel(model_id='eSR-TR_C48_K3_s2', in_channels=1, out_channels=filters, stride=2)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
-        self.color_balance = ColorBalance(filters) # 添加顏色平衡模塊
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
@@ -201,8 +193,6 @@ class LYT(nn.Module):
         )
     
     def _rgb_to_oklab(self, image):
-        # 正規化輸入RGB到[0, 1]，避免數值溢出
-        image = torch.clamp(image, 0, 1)
         r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
         l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
         m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
@@ -214,11 +204,8 @@ class LYT(nn.Module):
         L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
         a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
         b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-        # 正規化OKLab分量到合理範圍
-        L = torch.clamp(L, 0, 1)
-        a = torch.clamp(a, -1, 1)
-        b_out = torch.clamp(b_out, -1, 1)
-        return torch.stack((L, a, b_out), dim=1)
+        oklab = torch.stack((L, a, b_out), dim=1)
+        return oklab
 
     def forward(self, inputs):
         ycbcr = self._rgb_to_oklab(inputs)
@@ -233,19 +220,18 @@ class LYT(nn.Module):
         lum = y_processed
         lum_1 = self.lum_pool(lum)
         lum_1 = self.lum_mhsa(lum_1)
-        lum_1 = self.lum_up(lum_1)
+        lum_1 = self.lum_up1(lum_1)  # 4× 放大，輸出 [batch_size, 1, H/2, W/2]
+        lum_1 = self.lum_up2(lum_1)  # 2× 放大，輸出 [batch_size, filters, H, W]
         lum = lum + lum_1
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
         ref = self.msef(ref)
         ref = ref + shortcut
-        # 應用顏色平衡
-        ref = self.color_balance(ref)
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
         refined = self.final_refine(F.relu(recombined))
         output = self.final_adjustments(refined)
-        return output
+        return torch.sigmoid(output)
     
     def _init_weights(self):
         for module in self.children():

@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from pytorch_msssim import ms_ssim
-from skimage.color import deltaE_ciede2000
-import numpy as np
 
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, device):
@@ -19,20 +17,12 @@ class VGGPerceptualLoss(nn.Module):
         return F.mse_loss(self.loss_model(y_true), self.loss_model(y_pred))
 
 def color_loss(y_true, y_pred):
-    oklab_true = rgb_to_oklab(y_true)
+    # 改進：考慮 Oklab 空間中的 ab 通道一致性
+    oklab_true = rgb_to_oklab(y_true)  # 需要實現此函數
     oklab_pred = rgb_to_oklab(y_pred)
-    # 考慮 L、a、b 通道的差異
-    diff = torch.abs(oklab_true - oklab_pred)
-    return torch.mean(diff)  # 平均所有通道的差異
-
-def delta_e_loss(y_true, y_pred):
-    # 將 Tensor 轉為 NumPy 進行 Delta E 計算
-    y_true_np = y_true.permute(0, 2, 3, 1).cpu().detach().numpy()
-    y_pred_np = y_pred.permute(0, 2, 3, 1).cpu().detach().numpy()
-    oklab_true = rgb_to_oklab(y_true).permute(0, 2, 3, 1).cpu().detach().numpy()
-    oklab_pred = rgb_to_oklab(y_pred).permute(0, 2, 3, 1).cpu().detach().numpy()
-    delta_e = deltaE_ciede2000(oklab_true, oklab_pred)
-    return torch.tensor(np.mean(delta_e), device=y_true.device, requires_grad=True)
+    ab_true = oklab_true[:, 1:, :, :]  # a 和 b 通道
+    ab_pred = oklab_pred[:, 1:, :, :]
+    return torch.mean(torch.abs(ab_true - ab_pred))
 
 def psnr_loss(y_true, y_pred):
     mse = F.mse_loss(y_true, y_pred)
@@ -74,17 +64,16 @@ def rgb_to_oklab(image):
 class CombinedLoss(nn.Module):
     def __init__(self, device):
         super(CombinedLoss, self).__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:36]
+        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:36]  # 更深層特徵
         self.perceptual_loss_model = vgg.to(device).eval()
         for param in self.perceptual_loss_model.parameters():
             param.requires_grad = False
-        self.alpha1 = 0.8     # 降低 Smooth L1 權重
-        self.alpha2 = 0.3     # 提升感知損失權重
-        self.alpha3 = 0.1     # 提升直方圖損失權重
-        self.alpha4 = 0.8     # 保持 MS-SSIM 權重
-        self.alpha5 = 0.002   # 進一步降低 PSNR 權重
-        self.alpha6 = 0.5     # 略微提升色彩損失權重
-        self.alpha7 = 0.2     # Delta E 損失權重
+        self.alpha1 = 1.00    # Smooth L1
+        self.alpha2 = 0.15    # 提升感知損失權重
+        self.alpha3 = 0.05    # 直方圖損失
+        self.alpha4 = 0.8     # 提升 MS-SSIM 權重
+        self.alpha5 = 0.005   # 降低 PSNR 權重
+        self.alpha6 = 0.4     # 提升色彩損失權重
 
     def forward(self, y_true, y_pred):
         smooth_l1_l = smooth_l1_loss(y_true, y_pred)
@@ -92,11 +81,11 @@ class CombinedLoss(nn.Module):
         perc_l = F.mse_loss(self.perceptual_loss_model(y_true), self.perceptual_loss_model(y_pred))
         hist_l = histogram_loss(y_true, y_pred)
         psnr_l = psnr_loss(y_true, y_pred)
-        color_l = color_loss(y_true, y_pred)
-        delta_e_l = delta_e_loss(y_true, y_pred)  # 新增 Delta E 損失
+        oklab_true = rgb_to_oklab(y_true)
+        oklab_pred = rgb_to_oklab(y_pred)
+        color_l = torch.mean(torch.abs(oklab_true - oklab_pred))  # 考慮 L 通道
 
         total_loss = (self.alpha1 * smooth_l1_l + self.alpha2 * perc_l + 
                       self.alpha3 * hist_l + self.alpha5 * psnr_l + 
-                      self.alpha6 * color_l + self.alpha4 * ms_ssim_l + 
-                      self.alpha7 * delta_e_l)
+                      self.alpha6 * color_l + self.alpha4 * ms_ssim_l)
         return torch.mean(total_loss)
