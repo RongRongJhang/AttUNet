@@ -39,39 +39,15 @@ def histogram_loss(y_true, y_pred, bins=256, sigma=0.01):
     y_pred_hist /= y_pred_hist.sum() + 1e-8
     return torch.mean(torch.abs(y_true_hist - y_pred_hist))
 
-def color_constancy_loss(y_true, y_pred, lambda_var=0.1):
-    """
-    顏色恆常性損失：計算RGB通道均值和方差的MSE。
-    Args:
-        y_true: 真實圖像，形狀 [batch_size, 3, height, width]
-        y_pred: 預測圖像，形狀 [batch_size, 3, height, width]
-        lambda_var: 控制方差損失的權重
-    Returns:
-        顏色恆常性損失值
-    """
-    # 計算每個通道的均值
-    mean_true = torch.mean(y_true, dim=[2, 3])  # [batch_size, 3]
-    mean_pred = torch.mean(y_pred, dim=[2, 3])  # [batch_size, 3]
-    mean_loss = F.mse_loss(mean_pred, mean_true)
-
-    # 計算每個通道的標準差（方差的平方根）
-    var_true = torch.std(y_true, dim=[2, 3])  # [batch_size, 3]
-    var_pred = torch.std(y_pred, dim=[2, 3])  # [batch_size, 3]
-    var_loss = F.mse_loss(var_pred, var_true)
-
-    # 總顏色恆常性損失
-    return mean_loss + lambda_var * var_loss
-
 class CombinedLoss(nn.Module):
     def __init__(self, device):
         super(CombinedLoss, self).__init__()
         self.perceptual_loss = VGGPerceptualLoss(device)
         self.alpha1 = 1.00  # Smooth L1
-        self.alpha2 = 0.20  # 感知損失
+        self.alpha2 = 0.20  # 感知損失（略提升權重以補償移除的色彩損失）
         self.alpha3 = 0.05  # 直方圖損失
         self.alpha4 = 0.80  # MS-SSIM
         self.alpha5 = 0.005 # PSNR
-        self.alpha6 = 0.10  # 顏色恆常性損失（新加入）
 
     def forward(self, y_true, y_pred):
         smooth_l1_l = smooth_l1_loss(y_true, y_pred)
@@ -79,12 +55,10 @@ class CombinedLoss(nn.Module):
         perc_l = self.perceptual_loss(y_true, y_pred)
         hist_l = histogram_loss(y_true, y_pred)
         psnr_l = psnr_loss(y_true, y_pred)
-        color_l = color_constancy_loss(y_true, y_pred, lambda_var=0.1)
 
         total_loss = (self.alpha1 * smooth_l1_l + 
                       self.alpha2 * perc_l + 
                       self.alpha3 * hist_l + 
                       self.alpha4 * ms_ssim_l + 
-                      self.alpha5 * psnr_l + 
-                      self.alpha6 * color_l)
+                      self.alpha5 * psnr_l)
         return torch.mean(total_loss)
