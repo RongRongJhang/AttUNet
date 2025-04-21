@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import math
 from ecb import ECB
-from torchvision.transforms import ColorJitter
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -146,10 +145,8 @@ class LYT(nn.Module):
         self.denoiser_rgb = Denoiser(filters, kernel_size=3, activation='relu')
         self.channel_adjust = nn.Conv2d(3, filters, kernel_size=3, padding=1)  # 新增通道調整層
         self.msef = MSEFBlock(filters)
-        self.recombine = nn.Conv2d(filters, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
-        self.jitter = ColorJitter(brightness=0.1, contrast=0.2, saturation=0.3)
         self._init_weights()
 
     def forward(self, inputs):
@@ -160,11 +157,10 @@ class LYT(nn.Module):
         # MSEFBlock 處理
         ref = self.msef(adjusted)
         # 後續處理
-        recombined = self.recombine(ref)
-        refined = self.final_refine(F.relu(recombined))
-        output = self.final_adjustments(refined)
-        output = self.jitter(output)
-        return torch.sigmoid(output)
+        refined = self.final_refine(F.relu(ref))  # 形狀 [batch_size, filters, height, width]
+        output = self.final_adjustments(refined)  # 形狀 [batch_size, 3, height, width]
+
+        return (output + 1) / 2  # 改用 tanh 並縮放
     
     def _init_weights(self):
         for module in self.children():
