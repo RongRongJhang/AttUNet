@@ -3,7 +3,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
+from einops import rearrange
 from ecb import ECB
+
+# 新增的 CrossAttention 模組
+class CrossAttention(nn.Module):
+    def __init__(self, dim, kv_in_channels, num_heads=4, bias=False):
+        super(CrossAttention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.kv = nn.Conv2d(kv_in_channels, dim * 2, kernel_size=1, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self._init_weights()
+
+    def forward(self, x, y):  # x: 亮度特徵, y: 色度特徵
+        b, c, h, w = x.shape
+        q = rearrange(self.q(x), 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        kv = self.kv(y)
+        k, v = kv.chunk(2, dim=1)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        attn = F.softmax((q @ k.transpose(-2, -1)) * self.temperature, dim=-1)
+        out = rearrange(attn @ v, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        return self.project_out(out)
+
+    def _init_weights(self):
+        init.xavier_uniform_(self.q.weight)
+        init.xavier_uniform_(self.kv.weight)
+        init.xavier_uniform_(self.project_out.weight)
+        if self.q.bias is not None:
+            init.constant_(self.q.bias, 0)
+            init.constant_(self.kv.bias, 0)
+            init.constant_(self.project_out.bias, 0)
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -153,6 +187,12 @@ class LYT(nn.Module):
         self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
+
+        # 新增跨模態注意力模組
+        self.cross_attn_y = CrossAttention(filters, kv_in_channels=filters * 2, num_heads=8)  # 處理 cb_cr_combined (96 通道)
+        self.cross_attn_cb = CrossAttention(filters, kv_in_channels=filters, num_heads=8)    # 處理 y_processed (48 通道)
+        self.cross_attn_cr = CrossAttention(filters, kv_in_channels=filters, num_heads=8)    # 處理 y_processed (48 通道)
+
         self._init_weights()
 
     def _create_processing_layers(self, filters):
@@ -184,8 +224,15 @@ class LYT(nn.Module):
         y_processed = self.process_y(y)
         cb_processed = self.process_cb(cb_denoised)
         cr_processed = self.process_cr(cr_denoised)
-        ref = torch.cat([cb_processed, cr_processed], dim=1)
-        lum = y_processed
+
+        # 引入跨模態注意力，增強亮度和色度交互
+        cb_cr_combined = torch.cat([cb_processed, cr_processed], dim=1)  # 將 a 和 b 拼接，通道數為 filters * 2
+        y_enhanced = y_processed + self.cross_attn_y(y_processed, cb_cr_combined)  # 亮度受色度增強
+        cb_enhanced = cb_processed + self.cross_attn_cb(cb_processed, y_processed)  # a 受亮度增強
+        cr_enhanced = cr_processed + self.cross_attn_cr(cr_processed, y_processed)  # b 受亮度增強
+
+        ref = torch.cat([cb_enhanced, cr_enhanced], dim=1)
+        lum = y_enhanced
         lum_1 = self.lum_pool(lum)
         lum_1 = self.lum_mhsa(lum_1)
         lum_1 = self.lum_up(lum_1)

@@ -3,9 +3,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
+from einops import rearrange
 from ecb import ECB
 
-# model7
+# model4_modfy8
+
+# 新增的 CrossAttention 模組
+class CrossAttention(nn.Module):
+    def __init__(self, dim, kv_in_channels, num_heads=4, bias=False):
+        super(CrossAttention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.kv = nn.Conv2d(kv_in_channels, dim * 2, kernel_size=1, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self._init_weights()
+
+    def forward(self, x, y):  # x: 亮度特徵, y: 色度特徵
+        b, c, h, w = x.shape
+        q = rearrange(self.q(x), 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        kv = self.kv(y)
+        k, v = kv.chunk(2, dim=1)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        attn = F.softmax((q @ k.transpose(-2, -1)) * self.temperature, dim=-1)
+        out = rearrange(attn @ v, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        return self.project_out(out)
+
+    def _init_weights(self):
+        init.xavier_uniform_(self.q.weight)
+        init.xavier_uniform_(self.kv.weight)
+        init.xavier_uniform_(self.project_out.weight)
+        if self.q.bias is not None:
+            init.constant_(self.q.bias, 0)
+            init.constant_(self.kv.bias, 0)
+            init.constant_(self.project_out.bias, 0)
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -21,17 +55,19 @@ class ECABlock(nn.Module):
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 動態計算卷積核大小
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
-        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1  # 確保為奇數
+        # 修正：輸入和輸出通道數應為 channels，而不是 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
                               padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
         batch_size, channels, _, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels, 1)
-        y = self.conv(y)
-        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
+        y = self.avg_pool(x).view(batch_size, channels, 1)  # (B, C, 1)
+        y = self.conv(y)  # (B, C, 1)
+        y = torch.sigmoid(y).view(batch_size, channels, 1, 1)  # (B, C, 1, 1)
         return x * y
 
     def _init_weights(self):
@@ -42,7 +78,7 @@ class MSEFBlock(nn.Module):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
         self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)
+        self.eca_attn = ECABlock(filters)  # 使用修正後的 ECABlock
         self._init_weights()
 
     def forward(self, x):
@@ -99,35 +135,31 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = nn.Conv2d(3, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv1 = nn.Conv2d(2, num_filters, kernel_size=kernel_size, padding=1)
         self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
+        # 替換 refine 層為 ECB
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.up2 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
         self.up3 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
         self.up4 = nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True)
-        self.output_layer = nn.Conv2d(3, 3, kernel_size=kernel_size, padding=1)
-        self.res_layer = nn.Conv2d(num_filters, 3, kernel_size=kernel_size, padding=1)
+        self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
+        self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
         self._init_weights()
 
-    def activation_wrapper(self, x):
-        if self.activation == F.relu:
-            return self.activation(x, inplace=True)
-        return self.activation(x)
-
     def forward(self, x):
-        x1 = self.activation_wrapper(self.conv1(x))
-        x2 = self.activation_wrapper(self.conv2(x1))
-        x3 = self.activation_wrapper(self.conv3(x2))
-        x4 = self.activation_wrapper(self.conv4(x3))
+        x1 = self.activation(self.conv1(x))
+        x2 = self.activation(self.conv2(x1))
+        x3 = self.activation(self.conv3(x2))
+        x4 = self.activation(self.conv4(x3))
         x = self.bottleneck(x4)
         x = self.up4(x)
-        x = self.refine4(x + x3)
+        x = self.refine4(x + x3)  # 移除激活，因為 ECB 內部已包含 ReLU
         x = self.up3(x)
         x = self.refine3(x + x2)
         x = self.up2(x)
@@ -144,23 +176,75 @@ class Denoiser(nn.Module):
 class LYT(nn.Module):
     def __init__(self, filters=48):
         super(LYT, self).__init__()
-        self.denoiser_rgb = Denoiser(filters, kernel_size=3, activation='relu')
-        self.channel_adjust = nn.Conv2d(3, filters, kernel_size=3, padding=1)  # 新增通道調整層
+        self.process_y = self._create_processing_layers(filters)
+        self.process_cb = self._create_processing_layers(filters)
+        self.process_cr = self._create_processing_layers(filters)
+        self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
+        self.lum_pool = nn.MaxPool2d(8)
+        self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
+        self.lum_up = nn.Upsample(scale_factor=8, mode='bicubic', align_corners=True)
+        self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
+        self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
-        self.recombine = nn.Conv2d(filters, filters, kernel_size=3, padding=1)
+        self.recombine = nn.Conv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
+
+        # 新增跨模態注意力模組
+        self.cross_attn_y = CrossAttention(filters, kv_in_channels=filters * 2, num_heads=8)  # 處理 cb_cr_combined (96 通道)
+        self.cross_attn_cb = CrossAttention(filters, kv_in_channels=filters, num_heads=8)    # 處理 y_processed (48 通道)
+        self.cross_attn_cr = CrossAttention(filters, kv_in_channels=filters, num_heads=8)    # 處理 y_processed (48 通道)
+
         self._init_weights()
 
+    def _create_processing_layers(self, filters):
+        return nn.Sequential(
+            ECB(inp_planes=1, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=False),
+        )
+    
+    def _rgb_to_oklab(self, image):
+        r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
+        l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+        m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+        s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+        eps = 1e-6
+        l_ = torch.sign(l) * (torch.abs(l) + eps).pow(1/3)
+        m_ = torch.sign(m) * (torch.abs(m) + eps).pow(1/3)
+        s_ = torch.sign(s) * (torch.abs(s) + eps).pow(1/3)
+        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+        oklab = torch.stack((L, a, b_out), dim=1)
+        return oklab
+
     def forward(self, inputs):
-        # 直接使用 RGB 輸入進行去噪
-        rgb_denoised = self.denoiser_rgb(inputs) + inputs  # 去噪後的 RGB 圖片，形狀 [batch_size, 3, height, width]
-        # 調整通道數
-        adjusted = self.channel_adjust(rgb_denoised)  # 形狀 [batch_size, filters, height, width]
-        # MSEFBlock 處理
-        ref = self.msef(adjusted)
-        # 後續處理
-        recombined = self.recombine(ref)
+        ycbcr = self._rgb_to_oklab(inputs)
+        y, cb, cr = torch.split(ycbcr, 1, dim=1)
+        cbcr = torch.cat([cb, cr], dim=1)
+        cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
+        cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
+        y_processed = self.process_y(y)
+        cb_processed = self.process_cb(cb_denoised)
+        cr_processed = self.process_cr(cr_denoised)
+
+        # 引入跨模態注意力，增強亮度和色度交互
+        cb_cr_combined = torch.cat([cb_processed, cr_processed], dim=1)  # 將 a 和 b 拼接，通道數為 filters * 2
+        y_enhanced = y_processed + self.cross_attn_y(y_processed, cb_cr_combined)  # 亮度受色度增強
+        cb_enhanced = cb_processed + self.cross_attn_cb(cb_processed, y_processed)  # a 受亮度增強
+        cr_enhanced = cr_processed + self.cross_attn_cr(cr_processed, y_processed)  # b 受亮度增強
+
+        ref = torch.cat([cb_enhanced, cr_enhanced], dim=1)
+        lum = y_enhanced
+        lum_1 = self.lum_pool(lum)
+        lum_1 = self.lum_mhsa(lum_1)
+        lum_1 = self.lum_up(lum_1)
+        lum = lum + lum_1
+        ref = self.ref_conv(ref)
+        shortcut = ref
+        ref = ref + 0.2 * self.lum_conv(lum)
+        ref = self.msef(ref)
+        ref = ref + shortcut
+        recombined = self.recombine(torch.cat([ref, lum], dim=1))
         refined = self.final_refine(F.relu(recombined))
         output = self.final_adjustments(refined)
         return torch.sigmoid(output)
