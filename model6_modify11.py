@@ -3,65 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
-from math import sqrt
-
-class CalculateAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, Q, K, V, mask):
-        attention = torch.matmul(Q, torch.transpose(K, -1, -2))
-        attention = attention.masked_fill_(mask, -1e9)
-        attention = torch.softmax(attention / sqrt(Q.size(-1)), dim=-1)
-        attention = torch.matmul(attention, V)
-        return attention
-
-class Multi_CrossAttention(nn.Module):
-    def __init__(self, hidden_size, all_head_size, head_num):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.all_head_size = all_head_size
-        self.num_heads = head_num
-        self.h_size = all_head_size // head_num
-
-        assert all_head_size % head_num == 0
-
-        self.linear_q = nn.Linear(hidden_size, all_head_size, bias=False)
-        self.linear_k = nn.Linear(hidden_size, all_head_size, bias=False)
-        self.linear_v = nn.Linear(hidden_size, all_head_size, bias=False)
-        self.linear_output = nn.Linear(all_head_size, hidden_size)
-
-        self.norm = sqrt(all_head_size)
-        self._init_weights()
-
-    def _init_weights(self):
-        init.xavier_uniform_(self.linear_q.weight)
-        init.xavier_uniform_(self.linear_k.weight)
-        init.xavier_uniform_(self.linear_v.weight)
-        init.xavier_uniform_(self.linear_output.weight)
-
-    def forward(self, x, y, attention_mask):
-        batch_size = x.size(0)
-        q_s = self.linear_q(x).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
-        k_s = self.linear_k(y).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
-        v_s = self.linear_v(y).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
-
-        attention_mask = attention_mask.eq(0)
-
-        attention = CalculateAttention()(q_s, k_s, v_s, attention_mask)
-        attention = attention.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.h_size)
-        output = self.linear_output(attention)
-        return output
 
 class SeparableConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
         super(SeparableConv2d, self).__init__()
         self.depthwise = nn.Conv2d(
             in_channels, in_channels, kernel_size=kernel_size,
-            padding=padding, stride=stride, groups=in_channels, bias=bias
+            stride=stride, padding=padding, groups=in_channels, bias=bias
         )
         self.pointwise = nn.Conv2d(
-            in_channels, out_channels, kernel_size=1, padding=0, stride=1, bias=bias
+            in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=bias
         )
         self._init_weights()
 
@@ -77,6 +28,59 @@ class SeparableConv2d(nn.Module):
             init.constant_(self.depthwise.bias, 0)
         if self.pointwise.bias is not None:
             init.constant_(self.pointwise.bias, 0)
+
+class SeparableConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, bias=True):
+        super(SeparableConv1d, self).__init__()
+        self.depthwise = nn.Conv1d(
+            in_channels, in_channels, kernel_size=kernel_size,
+            padding=padding, groups=in_channels, bias=bias
+        )
+        self.pointwise = nn.Conv1d(
+            in_channels, out_channels, kernel_size=1, padding=0, bias=bias
+        )
+        self._init_weights()
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+    def _init_weights(self):
+        init.kaiming_uniform_(self.depthwise.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.kaiming_uniform_(self.pointwise.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if self.depthwise.bias is not None:
+            init.constant_(self.depthwise.bias, 0)
+        if self.pointwise.bias is not None:
+            init.constant_(self.pointwise.bias, 0)
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, dim_kv, num_heads, bias=False):
+        super(CrossAttention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.q = SeparableConv2d(dim, dim, kernel_size=1, bias=bias)
+        self.kv = SeparableConv2d(dim_kv, dim * 2, kernel_size=1, bias=bias)
+        self.project_out = SeparableConv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x, y):
+        b, c, h, w = x.shape
+        q = self.q(x)
+        kv = self.kv(y)
+        k, v = kv.chunk(2, dim=1)
+
+        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = F.softmax(attn, dim=-1)
+
+        out = (attn @ v).reshape(b, c, h, w)
+        return self.project_out(out)
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
@@ -94,8 +98,8 @@ class ECABlock(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
         kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
-        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
-                              padding=(kernel_size - 1) // 2, bias=False, groups=channels)
+        self.conv = SeparableConv1d(channels, channels, kernel_size=kernel_size, 
+                                    padding=(kernel_size - 1) // 2, bias=False)
         self._init_weights()
 
     def forward(self, x):
@@ -106,27 +110,28 @@ class ECABlock(nn.Module):
         return x * y
 
     def _init_weights(self):
-        init.kaiming_uniform_(self.conv.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if hasattr(self.conv, '_init_weights'):
+            self.conv._init_weights()
 
 class MSEFBlock(nn.Module):
     def __init__(self, filters):
         super(MSEFBlock, self).__init__()
         self.layer_norm = LayerNormalization(filters)
-        self.depthwise_conv = nn.Conv2d(filters, filters, kernel_size=3, padding=1, groups=filters)
-        self.eca_attn = ECABlock(filters)
+        self.depthwise_conv = SeparableConv2d(filters, filters, kernel_size=3, padding=1)
+        self.se_attn = ECABlock(filters)
         self._init_weights()
 
     def forward(self, x):
         x_norm = self.layer_norm(x)
         x1 = self.depthwise_conv(x_norm)
-        x2 = self.eca_attn(x_norm)
+        x2 = self.se_attn(x_norm)
         x_fused = x1 * x2
         x_out = x_fused + x
         return x_out
     
     def _init_weights(self):
-        init.kaiming_uniform_(self.depthwise_conv.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.constant_(self.depthwise_conv.bias, 0)
+        if hasattr(self.depthwise_conv, '_init_weights'):
+            self.depthwise_conv._init_weights()
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_size, num_heads):
@@ -170,19 +175,20 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = SeparableConv2d(2, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv1 = SeparableConv2d(3, num_filters, kernel_size=kernel_size, padding=1)
         self.conv2 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.bottleneck = Multi_CrossAttention(hidden_size=num_filters, all_head_size=num_filters, head_num=4)
+        self.attn_y = MultiHeadSelfAttention(embed_size=num_filters // 3, num_heads=4)
+        self.attn_cbcr = CrossAttention(dim=num_filters // 3 * 2, dim_kv=num_filters // 3, num_heads=4)
         self.refine4 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine3 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine2 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
-        self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
+        self.output_layer = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
+        self.res_layer = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
         self._init_weights()
 
@@ -191,20 +197,11 @@ class Denoiser(nn.Module):
         x2 = self.activation(self.conv2(x1))
         x3 = self.activation(self.conv3(x2))
         x4 = self.activation(self.conv4(x3))
-        
-        # 創建 attention_mask
-        batch_size, _, height, width = x4.size()
-        attention_mask = torch.ones(batch_size, height * width, height * width, device=x4.device)
-        
-        # 重塑 x4
-        x4_reshaped = x4.reshape(batch_size, height * width, -1)
-        
-        # 使用 Multi_CrossAttention
-        x = self.bottleneck(x4_reshaped, x4_reshaped, attention_mask)
-        
-        # 重塑回原始形狀
-        x = x.reshape(batch_size, height, width, -1).permute(0, 3, 1, 2)
-        
+        y, cb, cr = torch.split(x4, x4.size(1) // 3, dim=1)
+        cbcr = torch.cat([cb, cr], dim=1)
+        y = self.attn_y(y)
+        cbcr = self.attn_cbcr(cbcr, y)
+        x = torch.cat([y, cbcr], dim=1)
         x = self.up4(x)
         x = self.refine4(self.activation(x + x3))
         x = self.up3(x)
@@ -212,13 +209,13 @@ class Denoiser(nn.Module):
         x = self.up2(x)
         x = self.refine2(self.activation(x + x1))
         x = self.res_layer(x)
-        return torch.tanh(self.output_layer(x + x))
-    
+        return torch.tanh(self.output_layer(x))
+
     def _init_weights(self):
-        for layer in [self.output_layer, self.res_layer]:
-            init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
-            if layer.bias is not None:
-                init.constant_(layer.bias, 0)
+        for layer in [self.conv1, self.conv2, self.conv3, self.conv4, self.output_layer, self.res_layer,
+                      self.refine4, self.refine3, self.refine2]:
+            if hasattr(layer, '_init_weights'):
+                layer._init_weights()
 
 class LYT(nn.Module):
     def __init__(self, filters=48):
@@ -226,31 +223,23 @@ class LYT(nn.Module):
         self.process_y = self._create_processing_layers(filters)
         self.process_cb = self._create_processing_layers(filters)
         self.process_cr = self._create_processing_layers(filters)
-        self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
-        self.lum_pool = nn.MaxPool2d(8)
-        self.lum_mhsa = Multi_CrossAttention(hidden_size=filters, all_head_size=filters, head_num=8)
-        self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
-        self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
-        self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
+        self.denoiser = Denoiser(filters // 2)
+        self.denoiser_out_conv = SeparableConv2d(filters // 2, 3, kernel_size=3, padding=1)
+        self.lum_conv = SeparableConv2d(filters, filters, kernel_size=1, padding=0)
+        self.ref_conv = SeparableConv2d(filters * 2, filters, kernel_size=1, padding=0)
         self.msef = MSEFBlock(filters)
         self.recombine = SeparableConv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = SeparableConv2d(filters, filters, kernel_size=3, padding=1)
-        self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
+        self.final_adjustments = SeparableConv2d(filters, 3, kernel_size=3, padding=1)
         self._init_weights()
 
     def _create_processing_layers(self, filters):
         return nn.Sequential(
             SeparableConv2d(1, filters, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            SeparableConv2d(filters, filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
-    
-    def _rgb_to_ycbcr(self, image):
-        r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        u = -0.14713 * r - 0.28886 * g + 0.436 * b + 0.5
-        v = 0.615 * r - 0.51499 * g - 0.10001 * b + 0.5
-        yuv = torch.stack((y, u, v), dim=1)
-        return yuv
     
     def _rgb_to_oklab(self, image):
         r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
@@ -264,50 +253,30 @@ class LYT(nn.Module):
         L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
         a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
         b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-        oklab = torch.stack((L, a, b_out), dim=1)
-        return oklab
+        return torch.stack((L, a, b_out), dim=1)
 
     def forward(self, inputs):
         ycbcr = self._rgb_to_oklab(inputs)
-        y, cb, cr = torch.split(ycbcr, 1, dim=1)
-        cbcr = torch.cat([cb, cr], dim=1)
-        cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
-        cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
+        denoised_ycbcr = self.denoiser(ycbcr)
+        denoised_ycbcr = self.denoiser_out_conv(denoised_ycbcr) + ycbcr
+        y, cb, cr = torch.split(denoised_ycbcr, 1, dim=1)
         y_processed = self.process_y(y)
-        cb_processed = self.process_cb(cb_denoised)
-        cr_processed = self.process_cr(cr_denoised)
+        cb_processed = self.process_cb(cb)
+        cr_processed = self.process_cr(cr)
         ref = torch.cat([cb_processed, cr_processed], dim=1)
         lum = y_processed
-        lum_1 = self.lum_pool(lum)
-        
-        # 創建 attention_mask
-        batch_size, _, height, width = lum_1.size()
-        attention_mask = torch.ones(batch_size, height * width, height * width, device=lum_1.device)
-        
-        # 重塑 lum_1
-        lum_1_reshaped = lum_1.reshape(batch_size, height * width, -1)
-        
-        # 使用 Multi_CrossAttention
-        lum_1 = self.lum_mhsa(lum_1_reshaped, lum_1_reshaped, attention_mask)
-        
-        # 重塑回原始形狀
-        lum_1 = lum_1.reshape(batch_size, height, width, -1).permute(0, 3, 1, 2)
-        
-        lum_1 = self.lum_up(lum_1)
-        lum = lum + lum_1
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
         ref = self.msef(ref)
         ref = ref + shortcut
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
-        refined = self.final_refine(F.relu(recombined))
-        output = self.final_adjustments(refined)
+        refined = self.final_refine(F.relu(recombined)) + recombined
+        output = self.final_adjustments(refined) + inputs
         return torch.sigmoid(output)
     
     def _init_weights(self):
-        for module in self.children():
-            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
-                init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
-                if module.bias is not None:
-                    init.constant_(module.bias, 0)
+        for module in self.modules():
+            if isinstance(module, (SeparableConv2d, SeparableConv1d)):
+                if hasattr(module, '_init_weights'):
+                    module._init_weights()
