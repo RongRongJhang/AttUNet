@@ -121,59 +121,45 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        # 編碼器
         self.conv1 = SeparableConv2d(2, num_filters, kernel_size=kernel_size, padding=1)
         self.conv2 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv3 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv3 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv5 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, padding=1)
-        self.conv6 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
-        # 解碼器
-        self.refine6 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
-        self.refine5 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
+        self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=8)
         self.refine4 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine3 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine2 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
-        self.refine1 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
-        self.up6 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up5 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.output_layer = nn.Conv2d(num_filters, 2, kernel_size=kernel_size, padding=1)
+        self.output_layer = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=1)
+        self.res_layer = nn.Conv2d(num_filters, 1, kernel_size=kernel_size, padding=1)
         self.activation = getattr(F, activation)
         self._init_weights()
 
     def forward(self, x):
-        input_size = x.shape[2:]  # 保存輸入尺寸
-        # 編碼器
-        x1 = self.activation(self.conv1(x))  # 256 x 256
-        x2 = self.activation(self.conv2(x1))  # 128 x 128
-        x3 = self.activation(self.conv3(x2))  # 128 x 128
-        x4 = self.activation(self.conv4(x3))  # 64 x 64
-        x5 = self.activation(self.conv5(x4))  # 64 x 64
-        x6 = self.activation(self.conv6(x5))  # 32 x 32
-        # 瓶頸
-        x = self.bottleneck(x6)  # 32 x 32
-        # 解碼器
-        x = self.up6(x)  # 64 x 64
-        x = self.refine6(self.activation(x + x5))  # 匹配 x5
-        x = self.up5(x)  # 128 x 128
-        x = self.refine5(self.activation(x + x3))  # 匹配 x3
-        x = self.up4(x)  # 256 x 256
-        x = self.refine4(self.activation(x + x1))  # 匹配 x1
-        x = self.refine3(self.activation(x))
-        x = self.refine2(self.activation(x))
-        x = self.refine1(self.activation(x))  # [1, 16, 256, 256]
-        x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=True)  # 確保尺寸
-        return torch.tanh(self.output_layer(x))  # [1, 2, 256, 256]
-
+        x1 = self.activation(self.conv1(x))
+        x2 = self.activation(self.conv2(x1))
+        x3 = self.activation(self.conv3(x2))
+        x4 = self.activation(self.conv4(x3))
+        x = self.bottleneck(x4)
+        x = self.up4(x)
+        x = self.refine4(self.activation(x + x3))
+        x = self.up3(x)
+        x = self.refine3(self.activation(x + x2))
+        x = self.up2(x)
+        x = self.refine2(self.activation(x + x1))
+        x = self.res_layer(x)
+        return torch.tanh(self.output_layer(x + x))
+    
     def _init_weights(self):
-        init.kaiming_uniform_(self.output_layer.weight, a=0, mode='fan_in', nonlinearity='relu')
-        if self.output_layer.bias is not None:
-            init.constant_(self.output_layer.bias, 0)
+        for layer in [self.output_layer, self.res_layer]:
+            init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
+            if layer.bias is not None:
+                init.constant_(layer.bias, 0)
 
 class LYT(nn.Module):
-    def __init__(self, filters=48):
+    def __init__(self, filters=64):
         super(LYT, self).__init__()
         self.process_y = self._create_processing_layers(filters)
         self.process_cb = self._create_processing_layers(filters)
@@ -184,9 +170,7 @@ class LYT(nn.Module):
         self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
-        self.msef1 = MSEFBlock(filters)
-        self.msef2 = MSEFBlock(filters)
-        self.msef3 = MSEFBlock(filters)
+        self.msef = MSEFBlock(filters)
         self.recombine = SeparableConv2d(filters * 2, filters, kernel_size=3, padding=1)
         self.final_refine = SeparableConv2d(filters, filters, kernel_size=3, padding=1)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
@@ -195,8 +179,6 @@ class LYT(nn.Module):
     def _create_processing_layers(self, filters):
         return nn.Sequential(
             SeparableConv2d(1, filters, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            SeparableConv2d(filters, filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
     
@@ -224,11 +206,10 @@ class LYT(nn.Module):
         return oklab
 
     def forward(self, inputs):
-        input_size = inputs.shape[2:]  # 保存輸入尺寸
         ycbcr = self._rgb_to_oklab(inputs)
         y, cb, cr = torch.split(ycbcr, 1, dim=1)
         cbcr = torch.cat([cb, cr], dim=1)
-        cbcr_denoised = self.denoiser_cbcr(cbcr)  # 輸出 2 通道
+        cbcr_denoised = self.denoiser_cbcr(cbcr) + cbcr
         cb_denoised, cr_denoised = torch.split(cbcr_denoised, 1, dim=1)
         y_processed = self.process_y(y)
         cb_processed = self.process_cb(cb_denoised)
@@ -242,19 +223,16 @@ class LYT(nn.Module):
         ref = self.ref_conv(ref)
         shortcut = ref
         ref = ref + 0.2 * self.lum_conv(lum)
-        ref = self.msef1(ref)
-        ref = self.msef2(ref)
-        ref = self.msef3(ref)
+        ref = self.msef(ref)
         ref = ref + shortcut
         recombined = self.recombine(torch.cat([ref, lum], dim=1))
         refined = self.final_refine(F.relu(recombined))
         output = self.final_adjustments(refined)
-        output = F.interpolate(output, size=input_size, mode='bilinear', align_corners=True)
         return torch.sigmoid(output)
     
     def _init_weights(self):
         for module in self.children():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
+            if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     init.constant_(module.bias, 0)
