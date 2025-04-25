@@ -4,8 +4,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import math
 
-# model4_modify9
-
 class SeparableConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
         super(SeparableConv2d, self).__init__()
