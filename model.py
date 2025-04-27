@@ -3,8 +3,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import math
+from math import sqrt
 
-# model4_modify9
+# model4_modify10
+
+class CalculateAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q, K, V, mask):
+        attention = torch.matmul(Q, torch.transpose(K, -1, -2))
+        attention = attention.masked_fill_(mask, -1e9)
+        attention = torch.softmax(attention / sqrt(Q.size(-1)), dim=-1)
+        attention = torch.matmul(attention, V)
+        return attention
+
+class Multi_CrossAttention(nn.Module):
+    def __init__(self, hidden_size, all_head_size, head_num):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.all_head_size = all_head_size
+        self.num_heads = head_num
+        self.h_size = all_head_size // head_num
+
+        assert all_head_size % head_num == 0
+
+        self.linear_q = nn.Linear(hidden_size, all_head_size, bias=False)
+        self.linear_k = nn.Linear(hidden_size, all_head_size, bias=False)
+        self.linear_v = nn.Linear(hidden_size, all_head_size, bias=False)
+        self.linear_output = nn.Linear(all_head_size, hidden_size)
+
+        self.norm = sqrt(all_head_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        init.xavier_uniform_(self.linear_q.weight)
+        init.xavier_uniform_(self.linear_k.weight)
+        init.xavier_uniform_(self.linear_v.weight)
+        init.xavier_uniform_(self.linear_output.weight)
+
+    def forward(self, x, y, attention_mask):
+        batch_size = x.size(0)
+        q_s = self.linear_q(x).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
+        k_s = self.linear_k(y).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
+        v_s = self.linear_v(y).view(batch_size, -1, self.num_heads, self.h_size).transpose(1, 2)
+
+        attention_mask = attention_mask.eq(0)
+
+        attention = CalculateAttention()(q_s, k_s, v_s, attention_mask)
+        attention = attention.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.h_size)
+        output = self.linear_output(attention)
+        return output
 
 class SeparableConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding=0, stride=1, bias=True):
@@ -123,11 +172,11 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = SeparableConv2d(2, num_filters, kernel_size=kernel_size, padding=1)
-        self.conv2 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv3 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv4 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
+        self.conv1 = nn.Conv2d(2, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.bottleneck = Multi_CrossAttention(hidden_size=num_filters, all_head_size=num_filters, head_num=4)
         self.refine4 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine3 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine2 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
@@ -144,7 +193,20 @@ class Denoiser(nn.Module):
         x2 = self.activation(self.conv2(x1))
         x3 = self.activation(self.conv3(x2))
         x4 = self.activation(self.conv4(x3))
-        x = self.bottleneck(x4)
+        
+        # 創建 attention_mask
+        batch_size, _, height, width = x4.size()
+        attention_mask = torch.ones(batch_size, height * width, height * width, device=x4.device)
+        
+        # 重塑 x4
+        x4_reshaped = x4.reshape(batch_size, height * width, -1)
+        
+        # 使用 Multi_CrossAttention
+        x = self.bottleneck(x4_reshaped, x4_reshaped, attention_mask)
+        
+        # 重塑回原始形狀
+        x = x.reshape(batch_size, height, width, -1).permute(0, 3, 1, 2)
+        
         x = self.up4(x)
         x = self.refine4(self.activation(x + x3))
         x = self.up3(x)
@@ -168,7 +230,7 @@ class LYT(nn.Module):
         self.process_cr = self._create_processing_layers(filters)
         self.denoiser_cbcr = Denoiser(filters // 2, kernel_size=3, activation='relu')
         self.lum_pool = nn.MaxPool2d(8)
-        self.lum_mhsa = MultiHeadSelfAttention(embed_size=filters, num_heads=8)
+        self.lum_mhsa = Multi_CrossAttention(hidden_size=filters, all_head_size=filters, head_num=8)
         self.lum_up = nn.Upsample(scale_factor=8, mode='bilinear', align_corners=True)
         self.lum_conv = nn.Conv2d(filters, filters, kernel_size=1, padding=0)
         self.ref_conv = nn.Conv2d(filters * 2, filters, kernel_size=1, padding=0)
@@ -219,7 +281,20 @@ class LYT(nn.Module):
         ref = torch.cat([cb_processed, cr_processed], dim=1)
         lum = y_processed
         lum_1 = self.lum_pool(lum)
-        lum_1 = self.lum_mhsa(lum_1)
+        
+        # 創建 attention_mask
+        batch_size, _, height, width = lum_1.size()
+        attention_mask = torch.ones(batch_size, height * width, height * width, device=lum_1.device)
+        
+        # 重塑 lum_1
+        lum_1_reshaped = lum_1.reshape(batch_size, height * width, -1)
+        
+        # 使用 Multi_CrossAttention
+        lum_1 = self.lum_mhsa(lum_1_reshaped, lum_1_reshaped, attention_mask)
+        
+        # 重塑回原始形狀
+        lum_1 = lum_1.reshape(batch_size, height, width, -1).permute(0, 3, 1, 2)
+        
         lum_1 = self.lum_up(lum_1)
         lum = lum + lum_1
         ref = self.ref_conv(ref)

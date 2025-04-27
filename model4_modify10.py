@@ -170,10 +170,10 @@ class MultiHeadSelfAttention(nn.Module):
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
-        self.conv1 = SeparableConv2d(2, num_filters, kernel_size=kernel_size, padding=1)
-        self.conv2 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv3 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
-        self.conv4 = SeparableConv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.conv1 = nn.Conv2d(2, num_filters, kernel_size=kernel_size, padding=1)
+        self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.bottleneck = Multi_CrossAttention(hidden_size=num_filters, all_head_size=num_filters, head_num=4)
         self.refine4 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
         self.refine3 = SeparableConv2d(num_filters, num_filters, kernel_size=3, padding=1)
