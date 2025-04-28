@@ -5,8 +5,6 @@ import torch.nn.init as init
 import math
 from ecb import ECB
 
-# model7_modify3
-
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()
@@ -150,59 +148,15 @@ class LYT(nn.Module):
         self.recombine = nn.Conv2d(filters, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
-        self.gamma = 0.4  # Gamma 校正參數
         self._init_weights()
-
-    def _rgb_to_oklab(self, image):
-        # 分離 r, g, b 通道
-        r, g, b = image[:, 0, :, :], image[:, 1, :, :], image[:, 2, :, :]
-        
-        # 將線性 sRGB 轉換至中間表徵 l, m, s
-        l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
-        m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
-        s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
-        
-        # 分別取立方根 (使用 torch.sign 來正確處理正負值)
-        eps = 1e-6
-        l_ = torch.sign(l) * (torch.abs(l) + eps).pow(1/3)
-        m_ = torch.sign(m) * (torch.abs(m) + eps).pow(1/3)
-        s_ = torch.sign(s) * (torch.abs(s) + eps).pow(1/3)
-        
-        # 計算 Oklab 各通道
-        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
-        a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
-        b_out = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-        
-        # 合併 L, a, b 三個通道
-        oklab = torch.stack((L, a, b_out), dim=1)
-        return oklab
-    
-    def _gamma_correction(self, image, gamma):
-        # 確保輸入在 [0, 1] 範圍內，並添加數值穩定性
-        eps = 1e-8  # 避免零值問題
-        image = torch.clamp(image, 0, 1)  # 限制範圍
-        return torch.pow(image + eps, gamma)
 
     def forward(self, inputs):
         # 直接使用 RGB 輸入進行去噪
         rgb_denoised = self.denoiser_rgb(inputs) + inputs  # 去噪後的 RGB 圖片，形狀 [batch_size, 3, height, width]
-
-        oklab = self._rgb_to_oklab(rgb_denoised)  # 使用原始去噪後的 RGB 進行 Oklab 轉換
-        L, a, b = torch.split(oklab, 1, dim=1)
-
-        # 對 L 和 a 分支進行 Gamma 校正
-        L = self._gamma_correction(L, self.gamma)
-        a = self._gamma_correction(a, self.gamma)
-
-        # 將處理後的三個分支合併
-        combined = torch.cat([L, a, b], dim=1)  # 形狀 [batch_size, 3, height, width]
-
-        # 添加通道調整層，將通道數從 3 調整到 filters
-        combined_adjusted = self.channel_adjust(combined)  # 形狀 [batch_size, filters, height, width]
-
+        # 調整通道數
+        adjusted = self.channel_adjust(rgb_denoised)  # 形狀 [batch_size, filters, height, width]
         # MSEFBlock 處理
-        ref = self.msef(combined_adjusted)
-        
+        ref = self.msef(adjusted)
         # 後續處理
         recombined = self.recombine(ref)
         refined = self.final_refine(F.relu(recombined)) + recombined  # 增加殘差
