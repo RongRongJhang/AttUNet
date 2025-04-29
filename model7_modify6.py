@@ -5,55 +5,6 @@ import torch.nn.init as init
 import math
 from ecb import ECB
 
-class InceptionBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, reduction=0.25):
-        super(InceptionBlock, self).__init__()
-        # 計算各分支的通道數
-        reduced_channels = int(in_channels * reduction)
-        branch_channels = out_channels // 4
-
-        # 分支 1: 1x1 卷積
-        self.branch1 = nn.Conv2d(in_channels, branch_channels, kernel_size=1)
-
-        # 分支 2: 1x1 卷積 + 3x3 卷積
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(in_channels, reduced_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced_channels, branch_channels, kernel_size=3, padding=1)
-        )
-
-        # 分支 3: 1x1 卷積 + 5x5 卷積
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(in_channels, reduced_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced_channels, branch_channels, kernel_size=5, padding=2)
-        )
-
-        # 分支 4: 3x3 最大池化 + 1x1 卷積
-        self.branch4 = nn.Sequential(
-            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
-            nn.Conv2d(in_channels, branch_channels, kernel_size=1)
-        )
-
-        self._init_weights()
-
-    def forward(self, x):
-        # 並行計算各分支
-        branch1 = self.branch1(x)
-        branch2 = self.branch2(x)
-        branch3 = self.branch3(x)
-        branch4 = self.branch4(x)
-        # 在通道維度上拼接
-        output = torch.cat([branch1, branch2, branch3, branch4], dim=1)
-        return F.relu(output)
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
-                if module.bias is not None:
-                    init.constant_(module.bias, 0)
-
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()
@@ -71,8 +22,7 @@ class ECABlock(nn.Module):
         kernel_size = int(abs((math.log2(channels) + b) / gamma))
         kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
         self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, 
-                              padding=(kernel_size - 1) // 2, bias=False)
-        self.channel_interaction = nn.Conv2d(channels, channels, kernel_size=1)  # 新增通道交互
+                              padding=(kernel_size - 1) // 2, bias=False, groups=channels)
         self._init_weights()
 
     def forward(self, x):
@@ -80,13 +30,10 @@ class ECABlock(nn.Module):
         y = self.avg_pool(x).view(batch_size, channels, 1)
         y = self.conv(y)
         y = torch.sigmoid(y).view(batch_size, channels, 1, 1)
-        x = self.channel_interaction(x)  # 增強通道間關係
         return x * y
 
     def _init_weights(self):
         init.kaiming_uniform_(self.conv.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.kaiming_uniform_(self.channel_interaction.weight, a=0, mode='fan_in', nonlinearity='relu')
-        init.constant_(self.channel_interaction.bias, 0)
 
 class MSEFBlock(nn.Module):
     def __init__(self, filters):
@@ -151,13 +98,14 @@ class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
         self.conv1 = nn.Conv2d(3, num_filters, kernel_size=kernel_size, padding=1)
-        self.inception = InceptionBlock(num_filters, num_filters)  # 替換 conv2 為 Inception 模塊
+        self.conv2 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv3 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.conv4 = nn.Conv2d(num_filters, num_filters, kernel_size=kernel_size, stride=2, padding=1)
         self.bottleneck = MultiHeadSelfAttention(embed_size=num_filters, num_heads=4)
         self.refine4 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine3 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.refine2 = ECB(inp_planes=num_filters, out_planes=num_filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.output_layer = nn.Conv2d(3, 3, kernel_size=kernel_size, padding=1)
@@ -171,56 +119,142 @@ class Denoiser(nn.Module):
         return self.activation(x)
 
     def forward(self, x):
-        x1 = self.activation_wrapper(self.conv1(x))  # [batch_size, num_filters, H, W]
-        x2 = self.inception(x1)  # [batch_size, num_filters, H, W]
-        x3 = self.activation_wrapper(self.conv3(x2))  # [batch_size, num_filters, H//2, W//2]
-        x4 = self.activation_wrapper(self.conv4(x3))  # [batch_size, num_filters, H//4, W//4]
-        x = self.bottleneck(x4)  # [batch_size, num_filters, H//4, W//4]
-        x = self.up4(x)  # [batch_size, num_filters, H//2, W//2]
-        x = self.refine4(x + x3)  # [batch_size, num_filters, H//2, W//2]
-        x = self.up3(x)  # [batch_size, num_filters, H, W]
-        x = self.refine3(x + x2)  # [batch_size, num_filters, H, W]
-        # 移除 self.up2(x)，因為 x 已經與 x1 尺寸匹配
-        x = self.refine2(x + x1)  # [batch_size, num_filters, H, W]
-        x = self.res_layer(x)  # [batch_size, 3, H, W]
-        return torch.tanh(self.output_layer(x + x))  # [batch_size, 3, H, W]
+        x1 = self.activation_wrapper(self.conv1(x))
+        x2 = self.activation_wrapper(self.conv2(x1))
+        x3 = self.activation_wrapper(self.conv3(x2))
+        x4 = self.activation_wrapper(self.conv4(x3))
+        x = self.bottleneck(x4)
+        x = self.up4(x)
+        x = self.refine4(x + x3)
+        x = self.up3(x)
+        x = self.refine3(x + x2)
+        x = self.up2(x)
+        x = self.refine2(x + x1)
+        x = self.res_layer(x)
+        return torch.tanh(self.output_layer(x + x))
     
     def _init_weights(self):
-        for layer in [self.conv1, self.conv3, self.conv4, self.output_layer, self.res_layer]:
+        for layer in [self.conv1, self.conv2, self.conv3, self.conv4, self.output_layer, self.res_layer]:
             init.kaiming_uniform_(layer.weight, a=0, mode='fan_in', nonlinearity='relu')
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
+
+# New Color Enhancement Module
+class ColorEnhancementModule(nn.Module):
+    def __init__(self, channels):
+        super(ColorEnhancementModule, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.channel_attention = ECABlock(channels)
+        self.gamma = nn.Parameter(torch.ones(1))
+        self._init_weights()
+        
+    def forward(self, x):
+        # Enhance contrast first
+        x_enhanced = F.relu(self.conv1(x))
+        x_enhanced = self.conv2(x_enhanced)
+        # Apply channel attention for color enhancement
+        x_enhanced = self.channel_attention(x_enhanced)
+        # Weighted residual connection for controllable enhancement
+        return x + self.gamma * x_enhanced
+    
+    def _init_weights(self):
+        init.kaiming_uniform_(self.conv1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.kaiming_uniform_(self.conv2.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.constant_(self.conv1.bias, 0)
+        init.constant_(self.conv2.bias, 0)
+
+# Enhanced brightness adjustment
+class BrightnessEnhancementModule(nn.Module):
+    def __init__(self, channels):
+        super(BrightnessEnhancementModule, self).__init__()
+        self.conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(channels, channels//4, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels//4, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.brightness_scale = nn.Parameter(torch.tensor([1.2]))  # Adjustable brightness parameter
+        self._init_weights()
+        
+    def forward(self, x):
+        attention_map = self.spatial_attention(x)
+        # Apply brightness enhancement with spatial adaptivity
+        x_brightened = self.conv(x) * self.brightness_scale
+        return x + attention_map * x_brightened
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
 
 class LYT(nn.Module):
     def __init__(self, filters=48):
         super(LYT, self).__init__()
         self.denoiser_rgb = Denoiser(filters, kernel_size=3, activation='relu')
-        self.channel_adjust = nn.Conv2d(3, filters, kernel_size=3, padding=1)  # 新增通道調整層
+        self.channel_adjust = nn.Conv2d(3, filters, kernel_size=3, padding=1)
         self.msef = MSEFBlock(filters)
+        
+        # New modules for enhanced color and brightness
+        self.color_enhancement = ColorEnhancementModule(filters)
+        self.brightness_enhancement = BrightnessEnhancementModule(filters)
+        
         self.recombine = nn.Conv2d(filters, filters, kernel_size=3, padding=1)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
-        self.final_adjustments = nn.Conv2d(filters, 3, kernel_size=3, padding=1)
-        self.scale = nn.Parameter(torch.ones(1, 3, 1, 1))  # 在 __init__ 中定義
-        self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))  # 在 __init__ 中定義
+        
+        # Separate channel-wise processing for RGB
+        self.r_adjust = nn.Conv2d(filters, 1, kernel_size=1)
+        self.g_adjust = nn.Conv2d(filters, 1, kernel_size=1)
+        self.b_adjust = nn.Conv2d(filters, 1, kernel_size=1)
+        
+        # Global color contrast enhancement
+        self.color_contrast = nn.Parameter(torch.tensor([1.2]))  # Control global color contrast
+        self.color_bias = nn.Parameter(torch.zeros(3, 1, 1))     # Color channel bias
+        
         self._init_weights()
-    
+
     def forward(self, inputs):
-        # 直接使用 RGB 輸入進行去噪
-        rgb_denoised = self.denoiser_rgb(inputs) + inputs  # 去噪後的 RGB 圖片，形狀 [batch_size, 3, height, width]
-        # 調整通道數
-        adjusted = self.channel_adjust(rgb_denoised)  # 形狀 [batch_size, filters, height, width]
-        # MSEFBlock 處理
+        # Denoising
+        rgb_denoised = self.denoiser_rgb(inputs) + inputs
+        
+        # Channel adjustment
+        adjusted = self.channel_adjust(rgb_denoised)
+        
+        # MSEF processing
         ref = self.msef(adjusted)
-        # 後續處理
-        recombined = self.recombine(ref)
+        
+        # Color enhancement
+        color_enhanced = self.color_enhancement(ref)
+        
+        # Brightness enhancement
+        brightness_enhanced = self.brightness_enhancement(color_enhanced)
+        
+        # Recombine and refine
+        recombined = self.recombine(brightness_enhanced)
         refined = self.final_refine(F.relu(recombined)) + recombined
-        output = self.final_adjustments(refined) + inputs
-        # 使用 __init__ 中定義的 scale 和 bias
-        output = output * self.scale + self.bias
-        return torch.clamp(output, 0, 1)  # 確保輸出在 [0, 1]
+        
+        # Separate RGB channel processing
+        r = self.r_adjust(refined)
+        g = self.g_adjust(refined)
+        b = self.b_adjust(refined)
+        
+        # Combine RGB channels
+        rgb_output = torch.cat([r, g, b], dim=1)
+        
+        # Apply color contrast enhancement and bias
+        enhanced_output = rgb_output * self.color_contrast + self.color_bias
+        
+        # Add residual connection from input
+        final_output = enhanced_output + inputs
+        
+        # Use scaled tanh for wider dynamic range instead of sigmoid
+        return torch.tanh(final_output) * 1.2
     
     def _init_weights(self):
-        for module in self.children():
+        for module in self.modules():
             if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                 init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
