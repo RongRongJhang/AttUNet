@@ -5,8 +5,6 @@ import torch.nn.init as init
 import math
 from ecb import ECB
 
-# model7_modify5
-
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()

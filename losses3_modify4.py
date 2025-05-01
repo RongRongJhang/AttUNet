@@ -5,8 +5,6 @@ import torchvision.models as models
 from pytorch_msssim import ms_ssim
 from torch.fft import fft2, fftshift
 
-# loss3_modify4
-
 class EnhancedColorBrightnessLoss(nn.Module):
     def __init__(self):
         super(EnhancedColorBrightnessLoss, self).__init__()
