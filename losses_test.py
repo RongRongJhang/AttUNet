@@ -4,211 +4,146 @@ import torch.nn.functional as F
 import torchvision.models as models
 from pytorch_msssim import ms_ssim
 
-class AdaptiveColorBrightnessLoss(nn.Module):
-    def __init__(self):
-        super(AdaptiveColorBrightnessLoss, self).__init__()
-        # Add learnable parameters for color balance
-        self.color_weight = nn.Parameter(torch.tensor(0.08))  # Lower initial value
-        self.saturation_limit = nn.Parameter(torch.tensor(1.2))  # Limit over-saturation
-        
+class EnhancedColorLoss(nn.Module):
+    """
+    Calculates the difference in colorfulness between output and target.
+    Ref: Hasler and Suesstrunk, "Measuring colorfulness in natural images" (2003)
+    """
+    def __init__(self, eps=1e-6):
+        super(EnhancedColorLoss, self).__init__()
+        self.eps = eps
+
+    def calculate_colorfulness(self, img):
+        # img shape: (B, C, H, W), range [0, 1]
+        img_rgb = img.permute(0, 2, 3, 1) # B, H, W, C
+        rg = img_rgb[..., 0] - img_rgb[..., 1]
+        yb = 0.5 * (img_rgb[..., 0] + img_rgb[..., 1]) - img_rgb[..., 2]
+
+        std_rg = torch.std(rg, dim=[1, 2])
+        std_yb = torch.std(yb, dim=[1, 2])
+        mean_rg = torch.mean(rg, dim=[1, 2])
+        mean_yb = torch.mean(yb, dim=[1, 2])
+
+        # Combine standard deviations and means
+        colorfulness = torch.sqrt(std_rg**2 + std_yb**2 + self.eps) + 0.3 * torch.sqrt(mean_rg**2 + mean_yb**2 + self.eps)
+        return colorfulness # Shape: (B,)
+
     def forward(self, output, target):
-        # 色彩豐富度指標 (Color richness metric)
-        output_rgb = output.permute(0, 2, 3, 1)
-        target_rgb = target.permute(0, 2, 3, 1)
-        
-        # For output image
-        rg_out = output_rgb[..., 0] - output_rgb[..., 1]
-        yb_out = 0.5 * (output_rgb[..., 0] + output_rgb[..., 1]) - output_rgb[..., 2]
-        std_rg_out = torch.std(rg_out, dim=[1, 2])
-        std_yb_out = torch.std(yb_out, dim=[1, 2])
-        colorfulness_out = torch.sqrt(std_rg_out**2 + std_yb_out**2)
-        
-        # For target image - reference for colorfulness
-        rg_target = target_rgb[..., 0] - target_rgb[..., 1]
-        yb_target = 0.5 * (target_rgb[..., 0] + target_rgb[..., 1]) - target_rgb[..., 2]
-        std_rg_target = torch.std(rg_target, dim=[1, 2])
-        std_yb_target = torch.std(yb_target, dim=[1, 2])
-        colorfulness_target = torch.sqrt(std_rg_target**2 + std_yb_target**2)
-        
-        # Optimize to match target colorfulness but with a small boost
-        target_color = torch.clamp(colorfulness_target * self.saturation_limit, max=1.5)
-        color_diff = torch.abs(colorfulness_out - target_color)
-        color_loss = color_diff.mean()
-        
-        # Brightness preservation - multiple levels
-        # Overall brightness
-        brightness_diff_global = torch.abs(output.mean() - target.mean())
-        
-        # Channel-wise brightness
-        brightness_diff_channels = torch.abs(output.mean(dim=[2, 3]) - target.mean(dim=[2, 3])).mean()
-        
-        # Local brightness preservation (using pooled patches)
-        output_patches = F.avg_pool2d(output, kernel_size=16, stride=8)
-        target_patches = F.avg_pool2d(target, kernel_size=16, stride=8)
-        brightness_diff_local = torch.abs(output_patches - target_patches).mean()
-        
-        # Combined brightness loss
-        brightness_loss = 0.4 * brightness_diff_global + 0.4 * brightness_diff_channels + 0.2 * brightness_diff_local
-        
-        return self.color_weight * color_loss + 0.05 * brightness_loss
+        output_colorfulness = self.calculate_colorfulness(output)
+        target_colorfulness = self.calculate_colorfulness(target)
+
+        # Use L1 loss to minimize the difference
+        color_loss = F.l1_loss(output_colorfulness, target_colorfulness)
+        return color_loss
 
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, device):
         super(VGGPerceptualLoss, self).__init__()
-        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:36]
+        # Use VGG19 up to conv4_4 (layer 35 in features, index 34)
+        # weights=models.VGG19_Weights.IMAGENET1K_V1 is an alternative if DEFAULT causes issues
+        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features[:35]
         self.loss_model = vgg.to(device).eval()
-        self.feature_layers = [5, 12, 22, 32]  # Use multiple feature layers
         for param in self.loss_model.parameters():
             param.requires_grad = False
+        # Normalization parameters for ImageNet
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1))
 
-    def forward(self, y_true, y_pred):
-        y_true = y_true.to(next(self.loss_model.parameters()).device)
-        y_pred = y_pred.to(next(self.loss_model.parameters()).device)
+    def normalize(self, tensor):
+        # Input tensor is assumed to be in [0, 1] range
+        return (tensor - self.mean) / self.std
+
+    def forward(self, y_pred, y_true): # Note: Swapped order to match common LPIPS/Perceptual loss usage
+        y_pred_norm = self.normalize(y_pred)
+        y_true_norm = self.normalize(y_true)
         
-        # Extract features from multiple layers
-        loss = 0.0
-        features_true = []
-        features_pred = []
-        
-        # Store activations at different layers
-        activation_true = y_true
-        activation_pred = y_pred
-        
-        for i, layer in enumerate(self.loss_model):
-            activation_true = layer(activation_true)
-            activation_pred = layer(activation_pred)
-            
-            if i in self.feature_layers:
-                # Normalize features
-                norm_true = F.normalize(activation_true.view(activation_true.size(0), -1))
-                norm_pred = F.normalize(activation_pred.view(activation_pred.size(0), -1))
-                
-                # Calculate loss with layer-specific weights (deeper layers get higher weight)
-                layer_weight = 0.5 + 0.5 * (i / max(self.feature_layers))
-                layer_loss = F.mse_loss(norm_true, norm_pred) * layer_weight
-                loss += layer_loss
-                
-        return loss / len(self.feature_layers)
+        pred_features = self.loss_model(y_pred_norm)
+        true_features = self.loss_model(y_true_norm)
 
-def psnr_loss(y_true, y_pred):
-    mse = F.mse_loss(y_true, y_pred)
-    psnr = 20 * torch.log10(1.0 / torch.sqrt(mse + 1e-8))
-    return 40.0 - torch.mean(psnr)
+        # Using L1 loss on features often works well for perceptual loss
+        return F.l1_loss(pred_features, true_features)
 
-def detail_loss(y_true, y_pred):
-    # Extract high-frequency details using Laplacian filter
-    laplacian_kernel = torch.tensor([
-        [0, 1, 0],
-        [1, -4, 1],
-        [0, 1, 0]
-    ], dtype=torch.float32).view(1, 1, 3, 3).to(y_true.device)
-    
-    # Apply to each channel separately
-    details_true = torch.cat([
-        F.conv2d(y_true[:, i:i+1], laplacian_kernel, padding=1) 
-        for i in range(y_true.size(1))
-    ], dim=1)
-    
-    details_pred = torch.cat([
-        F.conv2d(y_pred[:, i:i+1], laplacian_kernel, padding=1) 
-        for i in range(y_pred.size(1))
-    ], dim=1)
-    
-    # Focus on preserving details (high-frequency components)
-    return F.l1_loss(details_true, details_pred)
+def psnr_loss(y_true, y_pred, max_val=1.0):
+    """Calculates PSNR loss. Aim to maximize PSNR -> minimize this loss."""
+    mse = F.mse_loss(y_true, y_pred, reduction='mean')
+    # Prevent log10(0)
+    if mse == 0:
+        # PSNR is infinite, loss should be minimal (or negative infinity if not clamped)
+        # Return a large negative number or a indicator that it's perfect.
+        # Using a very small loss value if perfect.
+         return torch.tensor(0.0, device=mse.device, dtype=mse.dtype) # Or a small negative number like -40.0
+    psnr = 20 * torch.log10(max_val / torch.sqrt(mse + 1e-9)) # Add epsilon for stability
+    # We want to maximize PSNR. A common way is to return -PSNR or (Target_PSNR - PSNR).
+    # Using 40 as a target reference, similar to original code. Higher PSNR means lower loss.
+    return 40.0 - psnr # Removed torch.mean() as mse_loss reduction='mean' already averages.
 
-def smooth_l1_loss(y_true, y_pred):
-    return F.smooth_l1_loss(y_true, y_pred)
+def smooth_l1_loss(y_true, y_pred, beta=1.0):
+    return F.smooth_l1_loss(y_pred, y_true, beta=beta, reduction='mean') # Swapped order consistent with convention
 
-def multiscale_ssim_loss(y_true, y_pred, max_val=1.0):
-    return 1.0 - ms_ssim(y_true, y_pred, data_range=max_val, size_average=True)
+def multiscale_ssim_loss(y_true, y_pred, max_val=1.0, **kwargs):
+    # Ensure win_size is odd and <= min(H, W)
+    # Default win_size in pytorch_msssim is 11
+    # Add K1, K2 defaults similar to TF implementation
+    return 1.0 - ms_ssim(y_pred, y_true, data_range=max_val, size_average=True, K=(0.01, 0.03), **kwargs) # Swapped order
 
-def adaptive_histogram_loss(y_true, y_pred, bins=256, sigma=0.01):
-    # Calculate importance weights based on image characteristics
-    edges = detect_edges(y_true)
-    importance = torch.sigmoid(edges * 5.0) + 0.5  # Higher weights for edge regions
-    
-    # Weighted histogram calculation
-    bin_edges = torch.linspace(0.0, 1.0, bins, device=y_true.device)
-    
-    # Gaussian kernel for smooth histograms
-    def gaussian_kernel(x, mu, sigma):
-        return torch.exp(-0.5 * ((x - mu) / sigma) ** 2)
-    
-    # Calculate histogram with importance weighting
-    y_true_flat = y_true.reshape(-1, 1)
-    y_pred_flat = y_pred.reshape(-1, 1)
-    importance_flat = importance.reshape(-1, 1)
-    
-    y_true_hist = torch.sum(gaussian_kernel(y_true_flat, bin_edges, sigma) * importance_flat, dim=0)
-    y_pred_hist = torch.sum(gaussian_kernel(y_pred_flat, bin_edges, sigma) * importance_flat, dim=0)
-    
-    # Normalize histograms
-    y_true_hist /= y_true_hist.sum() + 1e-8
-    y_pred_hist /= y_pred_hist.sum() + 1e-8
-    
-    # Calculate Earth Mover's Distance (approximation)
-    cdf_true = torch.cumsum(y_true_hist, dim=0)
-    cdf_pred = torch.cumsum(y_pred_hist, dim=0)
-    emd = torch.sum(torch.abs(cdf_true - cdf_pred))
-    
-    return emd
+def gaussian_kernel(x, mu, sigma):
+    # Ensure dimensions are broadcastable
+    # x: (B, C, H, W, 1)
+    # mu: (bins,) -> (1, 1, 1, 1, bins)
+    # sigma: scalar
+    mu = mu.view(1, 1, 1, 1, -1)
+    return torch.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
-def detect_edges(image):
-    # Simple Sobel edge detection
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                           dtype=torch.float32).view(1, 1, 3, 3).to(image.device)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                           dtype=torch.float32).view(1, 1, 3, 3).to(image.device)
-    
-    # Apply to grayscale version of the image
-    gray = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
-    grad_x = F.conv2d(gray, sobel_x, padding=1)
-    grad_y = F.conv2d(gray, sobel_y, padding=1)
-    
-    return torch.sqrt(grad_x**2 + grad_y**2)
+def histogram_loss(y_true, y_pred, bins=256, sigma=0.01):
+    device = y_true.device
+    bin_edges = torch.linspace(0.0, 1.0, bins, device=device)
+
+    # Process channel by channel or flatten? Flattening is simpler here.
+    y_true_flat = y_true.view(y_true.size(0), -1, 1) # B, N, 1
+    y_pred_flat = y_pred.view(y_pred.size(0), -1, 1) # B, N, 1
+
+    # Calculate weighted histograms per image in batch
+    true_hist_unnorm = torch.sum(gaussian_kernel(y_true_flat.unsqueeze(-1), bin_edges, sigma), dim=1) # B, bins
+    pred_hist_unnorm = torch.sum(gaussian_kernel(y_pred_flat.unsqueeze(-1), bin_edges, sigma), dim=1) # B, bins
+
+    # Normalize histograms per image
+    true_hist = true_hist_unnorm / (true_hist_unnorm.sum(dim=1, keepdim=True) + 1e-8)
+    pred_hist = pred_hist_unnorm / (pred_hist_unnorm.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Calculate L1 loss between histograms, average over batch
+    return torch.mean(torch.sum(torch.abs(true_hist - pred_hist), dim=1))
+
 
 class CombinedLoss(nn.Module):
     def __init__(self, device):
         super(CombinedLoss, self).__init__()
         self.perceptual_loss = VGGPerceptualLoss(device)
-        self.color_brightness_loss = AdaptiveColorBrightnessLoss()
-        
-        # Weights are learnable to adapt during training
-        self.log_weight_l1 = nn.Parameter(torch.tensor(0.0))    # Smooth L1 (initialized as exp(0)=1.0)
-        self.log_weight_perc = nn.Parameter(torch.tensor(-1.9)) # Perceptual (initialized as exp(-1.9)≈0.15)
-        self.log_weight_hist = nn.Parameter(torch.tensor(-3.0)) # Histogram (initialized as exp(-3.0)≈0.05)
-        self.log_weight_ssim = nn.Parameter(torch.tensor(-0.22)) # MS-SSIM (initialized as exp(-0.22)≈0.8)
-        self.log_weight_psnr = nn.Parameter(torch.tensor(-5.3)) # PSNR (initialized as exp(-5.3)≈0.005)
-        self.log_weight_color = nn.Parameter(torch.tensor(-2.3)) # Color (initialized as exp(-2.3)≈0.1)
-        self.log_weight_detail = nn.Parameter(torch.tensor(-3.7)) # Detail (new, initialized as exp(-3.7)≈0.025)
+        self.color_loss = EnhancedColorLoss()
 
-    def forward(self, y_true, y_pred):
-        # Convert log weights to actual weights (ensures positivity and better gradient behavior)
-        weight_l1 = torch.exp(self.log_weight_l1)
-        weight_perc = torch.exp(self.log_weight_perc)
-        weight_hist = torch.exp(self.log_weight_hist)
-        weight_ssim = torch.exp(self.log_weight_ssim)
-        weight_psnr = torch.exp(self.log_weight_psnr)
-        weight_color = torch.exp(self.log_weight_color)
-        weight_detail = torch.exp(self.log_weight_detail)
-        
-        # Calculate individual loss components
+        # Adjusted weights prioritizing PSNR/SSIM, slightly boosting Perceptual (for LPIPS)
+        self.alpha1 = 1.00  # Smooth L1 (Pixel consistency) - Keep high
+        self.alpha2 = 0.20  # Perceptual loss (LPIPS related) - Increased slightly
+        self.alpha3 = 0.05  # Histogram loss (Distribution) - Keep low or moderate
+        self.alpha4 = 0.90  # MS-SSIM (Structure) - Increased
+        self.alpha5 = 0.08  # PSNR loss (Pixel fidelity) - Increased significantly
+        self.alpha6 = 0.02  # Color difference loss - Reduced significantly / Optional
+
+    def forward(self, y_pred, y_true): # Changed order to y_pred, y_true for consistency
         smooth_l1_l = smooth_l1_loss(y_true, y_pred)
         ms_ssim_l = multiscale_ssim_loss(y_true, y_pred)
-        perc_l = self.perceptual_loss(y_true, y_pred)
-        hist_l = adaptive_histogram_loss(y_true, y_pred)
+        perc_l = self.perceptual_loss(y_pred, y_true)
+        hist_l = histogram_loss(y_true, y_pred)
         psnr_l = psnr_loss(y_true, y_pred)
-        color_bright_l = self.color_brightness_loss(y_true, y_pred)
-        detail_l = detail_loss(y_true, y_pred)
+        color_l = self.color_loss(y_pred, y_true)
 
-        # Combine losses with learned weights
-        total_loss = (weight_l1 * smooth_l1_l + 
-                      weight_perc * perc_l + 
-                      weight_hist * hist_l + 
-                      weight_ssim * ms_ssim_l + 
-                      weight_psnr * psnr_l + 
-                      weight_color * color_bright_l +
-                      weight_detail * detail_l)
-        
-        return torch.mean(total_loss)
+        total_loss = (self.alpha1 * smooth_l1_l +
+                      self.alpha2 * perc_l +
+                      self.alpha3 * hist_l +
+                      self.alpha4 * ms_ssim_l +
+                      self.alpha5 * psnr_l +
+                      self.alpha6 * color_l)
+
+        # No need for torch.mean(total_loss) if individual losses are already averaged per batch element
+        # Check if individual losses return per-element loss or mean loss
+        # Assuming they return mean loss across batch (check implementations)
+        return total_loss
