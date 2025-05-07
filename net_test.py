@@ -1,7 +1,7 @@
 from thop import profile
 import torch
 import time
-from model_test import LYT
+from model import LYT
 
 # 設定裝置
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
