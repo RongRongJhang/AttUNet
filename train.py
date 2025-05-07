@@ -28,10 +28,21 @@ def validate(model, dataloader, device, result_dir):
 
 def main():
     # Hyperparameters
-    train_low = 'data/LOLv1/Train/input'
-    train_high = 'data/LOLv1/Train/target'
-    test_low = 'data/LOLv1/Test/input'
-    test_high = 'data/LOLv1/Test/target/'
+    # train_low = 'data/LOLv1/Train/input'
+    # train_high = 'data/LOLv1/Train/target'
+    # test_low = 'data/LOLv1/Test/input'
+    # test_high = 'data/LOLv1/Test/target/'
+    
+    train_low = 'data/LOLv2/Real_captured/Train/Low'
+    train_high = 'data/LOLv2/Real_captured/Train/Normal'
+    test_low = 'data/LOLv2/Real_captured/Test/Low'
+    test_high = 'data/LOLv2/Real_captured/Test/Normal'
+
+    # train_low = 'data/LOLv2/Synthetic/Train/Low'
+    # train_high = 'data/LOLv2/Synthetic/Train/Normal'
+    # test_low = 'data/LOLv2/Synthetic/Test/Low'
+    # test_high = 'data/LOLv2/Synthetic/Test/Normal'
+
     learning_rate = 2e-4 
     num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -83,7 +94,7 @@ def main():
         avg_psnr, avg_ssim, avg_lpips = metrics(result_dir + '*.png', test_high, use_GT_mean=True)
         
         current_lr = optimizer.param_groups[0]['lr']
-        print(f'Epoch {epoch + 1}/{num_epochs}, LR: {current_lr:.4f}, Loss: {avg_train_loss:.4f}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f}')
+        print(f'Epoch {epoch + 1}/{num_epochs}, LR: {current_lr:.4f}, Loss: {avg_train_loss:.6f}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f}')
 
         scheduler.step()
 
@@ -117,7 +128,7 @@ def main():
                 f.write("|   Timestemp   |   Epoch   |    LR    |   Loss   |   PSNR   |   SSIM   |   LPIPS   |\n")
                 f.write("|---------------|-----------|----------|----------|----------|----------|-----------|\n")
             
-            f.write(f"|   {now}   | {epoch + 1} | {current_lr:.4f} | {avg_train_loss:.4f} |  {avg_psnr:.4f}  |  {avg_ssim:.4f}  |  {avg_lpips:.4f}  |\n")
+            f.write(f"|   {now}   | {epoch + 1} | {current_lr:.4f} | {avg_train_loss:.6f} |  {avg_psnr:.4f}  |  {avg_ssim:.4f}  |  {avg_lpips:.4f}  |\n")
 
 if __name__ == '__main__':
     main()

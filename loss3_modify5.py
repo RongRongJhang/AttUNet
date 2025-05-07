@@ -99,8 +99,8 @@ def histogram_loss(y_true, y_pred, bins=256, sigma=0.01):
     bin_edges = torch.linspace(0.0, 1.0, bins, device=device)
 
     # Process channel by channel or flatten? Flattening is simpler here.
-    y_true_flat = y_true.view(y_true.size(0), -1, 1) # B, N, 1
-    y_pred_flat = y_pred.view(y_pred.size(0), -1, 1) # B, N, 1
+    y_true_flat = y_true.reshape(y_true.size(0), -1, 1) # B, N, 1
+    y_pred_flat = y_pred.reshape(y_pred.size(0), -1, 1) # B, N, 1
 
     # Calculate weighted histograms per image in batch
     true_hist_unnorm = torch.sum(gaussian_kernel(y_true_flat.unsqueeze(-1), bin_edges, sigma), dim=1) # B, bins
