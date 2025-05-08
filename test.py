@@ -27,11 +27,11 @@ def main():
     # test_low = 'data/LOLv1/Test/input'
     # test_high = 'data/LOLv1/Test/target'
 
-    test_low = 'data/LOLv2/Real_captured/Test/Low'
-    test_high = 'data/LOLv2/Real_captured/Test/Normal'
+    # test_low = 'data/LOLv2/Real_captured/Test/Low'
+    # test_high = 'data/LOLv2/Real_captured/Test/Normal'
 
-    # test_low = 'data/LOLv2/Synthetic/Test/Low'
-    # test_high = 'data/LOLv2/Synthetic/Test/Normal'
+    test_low = 'data/LOLv2/Synthetic/Test/Low'
+    test_high = 'data/LOLv2/Synthetic/Test/Normal'
 
     weights_path = '/content/drive/MyDrive/Att-UNet/best_model.pth'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

@@ -32,16 +32,16 @@ def main():
     # train_high = 'data/LOLv1/Train/target'
     # test_low = 'data/LOLv1/Test/input'
     # test_high = 'data/LOLv1/Test/target/'
-    
-    train_low = 'data/LOLv2/Real_captured/Train/Low'
-    train_high = 'data/LOLv2/Real_captured/Train/Normal'
-    test_low = 'data/LOLv2/Real_captured/Test/Low'
-    test_high = 'data/LOLv2/Real_captured/Test/Normal'
 
-    # train_low = 'data/LOLv2/Synthetic/Train/Low'
-    # train_high = 'data/LOLv2/Synthetic/Train/Normal'
-    # test_low = 'data/LOLv2/Synthetic/Test/Low'
-    # test_high = 'data/LOLv2/Synthetic/Test/Normal'
+    # train_low = 'data/LOLv2/Real_captured/Train/Low'
+    # train_high = 'data/LOLv2/Real_captured/Train/Normal'
+    # test_low = 'data/LOLv2/Real_captured/Test/Low'
+    # test_high = 'data/LOLv2/Real_captured/Test/Normal'
+
+    train_low = 'data/LOLv2/Synthetic/Train/Low'
+    train_high = 'data/LOLv2/Synthetic/Train/Normal'
+    test_low = 'data/LOLv2/Synthetic/Test/Low'
+    test_high = 'data/LOLv2/Synthetic/Test/Normal'
 
     learning_rate = 2e-4 
     num_epochs = 1000
