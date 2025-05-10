@@ -25,8 +25,6 @@ class ShuffleAttention(nn.Module):
         # 修改權重形狀以匹配分組後的通道數
         self.cweight = nn.Parameter(torch.zeros(1, self.group_channels, 1, 1))
         self.cbias = nn.Parameter(torch.ones(1, self.group_channels, 1, 1))
-        self.sweight = nn.Parameter(torch.zeros(1, self.group_channels, 1, 1))
-        self.sbias = nn.Parameter(torch.ones(1, self.group_channels, 1, 1))
         
         self.sigmoid = nn.Sigmoid()
         self._init_weights()
@@ -133,7 +131,7 @@ class LaaFNet(nn.Module):
                                act_type='relu', with_idt=True)
         self.final_conv = nn.Sequential(
             nn.Conv2d(filters, filters//2, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.ReLU(0.2, inplace=True),
             nn.Conv2d(filters//2, 3, 3, padding=1)
         )
         self._init_weights()
