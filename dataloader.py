@@ -2,7 +2,6 @@ import os
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-import random
 
 class PairedDataset(Dataset):
     def __init__(self, low_dir, high_dir, transform=None, crop_size=None, training=True):

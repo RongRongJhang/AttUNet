@@ -4,8 +4,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from ecb import ECB
 
-# model7_modify8
-
 class GroupNormalization(nn.Module):
     def __init__(self, dim):
         super(GroupNormalization, self).__init__()

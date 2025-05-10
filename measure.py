@@ -1,5 +1,4 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import torch
 import glob
 import cv2
@@ -7,8 +6,8 @@ import lpips
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-import argparse
-import platform
+
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 
 def ssim(prediction, target):
     C1 = (0.01 * 255)**2

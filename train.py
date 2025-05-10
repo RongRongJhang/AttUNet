@@ -1,18 +1,14 @@
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import torchvision.transforms as transforms
 from torchvision.utils import save_image
-from model import LYT
+from model import LaaFNet
 from losses import CombinedLoss
 from dataloader import create_dataloaders
 import os
-import numpy as np
 from datetime import datetime
 from measure import metrics
-from tqdm import tqdm
+from torch.amp import GradScaler, autocast
 
 def validate(model, dataloader, device, result_dir):
     model.eval()
@@ -27,6 +23,8 @@ def validate(model, dataloader, device, result_dir):
             save_image(output, save_path)
 
 def main():
+    torch.backends.cudnn.benchmark = True
+
     # Hyperparameters
     train_low = 'data/LOLv1/Train/input'
     train_high = 'data/LOLv1/Train/target'
@@ -45,6 +43,7 @@ def main():
 
     learning_rate = 2e-4 
     num_epochs = 1000
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'LR: {learning_rate}; Epochs: {num_epochs}')
 
@@ -55,22 +54,33 @@ def main():
     print(f'Train loader: {len(train_loader)}; Test loader: {len(test_loader)}')
 
     # Model, loss, optimizer, and scheduler
-    model = LYT().to(device)
+    model = LaaFNet().to(device)
 
-    # criterion = CombinedLoss(device, total_epochs=num_epochs).to(device)
+    # Use torch.compile() (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and device.type == 'cuda':
+        print("Compiling the model with torch.compile()... (This may take a moment)")
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print("Model compiled successfully.")
+        except Exception as e:
+            print(f"torch.compile failed: {e}. Proceeding without compilation.")
+    elif not hasattr(torch, 'compile'):
+        print("torch.compile not available (requires PyTorch 2.0+). Proceeding without compilation.")
+    else:
+        print("torch.compile skipped (not on CUDA or other condition).")
+
     criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = GradScaler('cuda')
 
-    best_psnr = 0
-    best_ssim = 0
-    best_lpips = 1
+    best_psnr = 0.0
+    best_ssim = 0.0
+    best_lpips = 1.0
     
     print('Training started.')
     for epoch in range(num_epochs):
 
-        # criterion.set_epoch(epoch)  # 在每個 epoch 開始時更新權重
         model.train()
         train_loss = 0.0
 
@@ -79,8 +89,9 @@ def main():
 
             optimizer.zero_grad()
 
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            with autocast():  # 啟用混合精度
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
