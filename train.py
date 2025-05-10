@@ -8,7 +8,7 @@ from dataloader import create_dataloaders
 import os
 from datetime import datetime
 from measure import metrics
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 
 def validate(model, dataloader, device, result_dir):
     model.eval()
@@ -56,19 +56,6 @@ def main():
     # Model, loss, optimizer, and scheduler
     model = LaaFNet().to(device)
 
-    # Use torch.compile() (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and device.type == 'cuda':
-        print("Compiling the model with torch.compile()... (This may take a moment)")
-        try:
-            model = torch.compile(model, mode='reduce-overhead')
-            print("Model compiled successfully.")
-        except Exception as e:
-            print(f"torch.compile failed: {e}. Proceeding without compilation.")
-    elif not hasattr(torch, 'compile'):
-        print("torch.compile not available (requires PyTorch 2.0+). Proceeding without compilation.")
-    else:
-        print("torch.compile skipped (not on CUDA or other condition).")
-
     criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -89,9 +76,8 @@ def main():
 
             optimizer.zero_grad()
 
-            with autocast('cuda'):  # 啟用混合精度
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
