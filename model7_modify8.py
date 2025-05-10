@@ -55,6 +55,27 @@ class MSEFBlock(nn.Module):
         init.kaiming_uniform_(self.depthwise_conv.weight, a=0, mode='fan_in', nonlinearity='relu')
         init.constant_(self.depthwise_conv.bias, 0)
 
+class ColorBrightnessAdjustment(nn.Module):
+    def __init__(self, channels):
+        super(ColorBrightnessAdjustment, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels//4, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels//4, 4, 3, padding=1)  # Output RGB + brightness
+        self.sigmoid = nn.Sigmoid()
+        self._init_weights()
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x), inplace=True)
+        adj = self.conv2(x)
+        color_weights = self.sigmoid(adj[:, :3]) * 1.5  # Scale to enhance color (0-1.5 range)
+        brightness_map = self.sigmoid(adj[:, 3:]) + 0.5  # Center around 1.0 (0.5-1.5 range)
+        return color_weights, brightness_map
+    
+    def _init_weights(self):
+        init.kaiming_uniform_(self.conv1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.kaiming_uniform_(self.conv2.weight, a=0, mode='fan_in', nonlinearity='relu')
+        init.constant_(self.conv1.bias, 0)
+        init.constant_(self.conv2.bias, 0)
+
 class Denoiser(nn.Module):
     def __init__(self, num_filters, kernel_size=3, activation='relu'):
         super(Denoiser, self).__init__()
@@ -92,6 +113,7 @@ class LaaFNet(nn.Module):
         super(LaaFNet, self).__init__()
         self.denoiser = Denoiser(filters, kernel_size=3, activation='relu')
         self.msef = MSEFBlock(filters)
+        self.color_brightness_adjust = ColorBrightnessAdjustment(filters)
         self.final_refine = ECB(inp_planes=filters, out_planes=filters, depth_multiplier=1.0, act_type='relu', with_idt=True)
         self.final_conv = nn.Sequential(
             nn.Conv2d(filters, filters//2, 3, padding=1),
@@ -103,8 +125,11 @@ class LaaFNet(nn.Module):
     def forward(self, inputs):      
         denoised = self.denoiser(inputs)
         enhanced = self.msef(denoised)
+        color_weights, brightness_map = self.color_brightness_adjust(enhanced)
         refined = self.final_refine(enhanced) + enhanced
         output = self.final_conv(refined)
+        output = output * brightness_map  # Brightness adjustment
+        output = output * (1 + color_weights)  # Color enhancement
         output = output + inputs
 
         return (torch.tanh(output) + 1) / 2

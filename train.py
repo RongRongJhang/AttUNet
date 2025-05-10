@@ -89,7 +89,7 @@ def main():
 
             optimizer.zero_grad()
 
-            with autocast():  # 啟用混合精度
+            with autocast('cuda'):  # 啟用混合精度
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
             
