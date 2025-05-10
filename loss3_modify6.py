@@ -5,8 +5,6 @@ import torchvision.models as models
 from pytorch_msssim import ms_ssim
 from torch.fft import fft2, fftshift
 
-# loss3_modify6
-
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, device):
         super(VGGPerceptualLoss, self).__init__()

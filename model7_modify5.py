@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-import math
 from ecb import ECB
 
 class LayerNormalization(nn.Module):
