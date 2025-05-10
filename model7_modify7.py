@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from ecb import ECB
 
-# model7_modify7: model7_modify5 精簡化
+# model7_modify5 精簡化
 
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
