@@ -130,9 +130,9 @@ class EfficientDenoiser(nn.Module):
             if layer.bias is not None:
                 init.constant_(layer.bias, 0)
 
-class LYT(nn.Module):
+class LaaFNet(nn.Module):
     def __init__(self, filters=48):
-        super(LYT, self).__init__()
+        super(LaaFNet, self).__init__()
         self.denoiser = EfficientDenoiser(filters, kernel_size=3, activation='relu')
         self.msef = LightweightMSEFBlock(filters)
         self.color_brightness_adjust = ColorBrightnessAdjustment(filters)
@@ -146,8 +146,6 @@ class LYT(nn.Module):
         self._init_weights()
 
     def forward(self, inputs):
-        # Get input size for proper resizing
-        input_size = inputs.size()[2:]
         
         # Enhanced denoising
         denoised = self.denoiser(inputs)
@@ -180,6 +178,3 @@ class LYT(nn.Module):
                 init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.xavier_normal_(m.weight)
-                init.constant_(m.bias, 0)

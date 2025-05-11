@@ -4,8 +4,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from ecb import ECB
 
-# model7_modify5_fix2
-
 class LayerNormalization(nn.Module):
     def __init__(self, dim):
         super(LayerNormalization, self).__init__()
@@ -14,9 +12,9 @@ class LayerNormalization(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, dim, 1, 1))
 
     def forward(self, x):
-        x = x.permute(0, 2, 3, 1).contiguous()
+        x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
-        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.permute(0, 3, 1, 2)
         return x * self.gamma + self.beta
 
 class ShuffleAttention(nn.Module):
@@ -41,13 +39,13 @@ class ShuffleAttention(nn.Module):
         
         # Channel attention
         y = self.avg_pool(x)  # [b, c, 1, 1]
-        y = y.reshape(b * self.groups, self.group_channels, 1, 1)
+        y = y.view(b * self.groups, self.group_channels, 1, 1)
         y = self.sigmoid(y * self.weight + self.bias)
         
         # Spatial attention
-        x_group = x.reshape(b * self.groups, self.group_channels, h, w)
+        x_group = x.view(b * self.groups, self.group_channels, h, w)
         out = x_group * y
-        out = out.reshape(b, c, h, w)
+        out = out.view(b, c, h, w)
         
         return out
 
