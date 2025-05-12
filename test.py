@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torchmetrics.functional import structural_similarity_index_measure
 from model import LaaFNet
-from dataloader import create_dataloaders, create_unpaired_dataloaders
+from dataloader import create_paired_dataloaders, create_unpaired_dataloaders
 import os
 import numpy as np
 from torchvision.utils import save_image
@@ -52,7 +52,7 @@ def main():
     result_dir = '/content/drive/MyDrive/Att-UNet/results/testing/output/'
 
     # _, test_loader = create_dataloaders(None, None, test_low, test_high, crop_size=None, batch_size=1)
-    test_loader = create_unpaired_dataloaders(test_low, num_workers=4, batch_size=1, shuffle=False)
+    test_loader = create_unpaired_dataloaders(test_low, batch_size=1)
 
     print(f'Test loader: {len(test_loader)}')
 
@@ -64,7 +64,7 @@ def main():
 
     # avg_psnr, avg_ssim, avg_lpips = metrics(result_dir + '*.png', test_high, use_GT_mean=True)
     # print(f'Validation PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}, LPIPS: {avg_lpips:.4f}')
-    avg_niqe, avg_brisque = metrics_niqu(result_dir)
+    avg_niqe, avg_brisque = metrics_niqu(result_dir + '*.bmp')
     print(f'Validation NIQE: {avg_niqe:.4f}, BRISQUE: {avg_brisque:.4f}')
 
     # write log

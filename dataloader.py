@@ -89,7 +89,7 @@ def create_unpaired_dataloaders(test_low, crop_size=256, batch_size=1):
     test_loader = None
 
     if test_low:
-        test_dataset = UnpairedDataset(test_low, transform=transform)
+        test_dataset = UnpairedDataset(test_low, transform=transform, crop_size=crop_size)
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     return test_loader
