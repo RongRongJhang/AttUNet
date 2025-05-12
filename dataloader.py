@@ -37,8 +37,34 @@ class PairedDataset(Dataset):
 
         # 返回低光圖片名稱
         return low_image, high_image, self.low_images[idx]
+    
+class UnpairedDataset(Dataset):
+    def __init__(self, low_dir, transform=None, crop_size=None):
+        self.low_dir = low_dir
+        self.transform = transform
+        self.crop_size = crop_size
 
-def create_dataloaders(train_low, train_high, test_low, test_high, crop_size=256, batch_size=1):
+        self.low_images = sorted([f for f in os.listdir(low_dir) if os.path.isfile(os.path.join(low_dir, f))])
+
+    def __len__(self):
+        return len(self.low_images)
+
+    def __getitem__(self, idx):
+        low_image_path = os.path.join(self.low_dir, self.low_images[idx])
+
+        low_image = Image.open(low_image_path).convert('RGB')
+
+        if self.transform:
+            low_image = self.transform(low_image)
+
+        if self.crop_size:
+            i, j, h, w = transforms.RandomCrop.get_params(low_image, output_size=(self.crop_size, self.crop_size))
+            low_image = transforms.functional.crop(low_image, i, j, h, w)
+
+        # 返回低光圖片名稱
+        return low_image, self.low_images[idx]
+
+def create_paired_dataloaders(train_low, train_high, test_low, test_high, crop_size=256, batch_size=1):
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
@@ -54,3 +80,16 @@ def create_dataloaders(train_low, train_high, test_low, test_high, crop_size=256
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
     return train_loader, test_loader
+
+
+def create_unpaired_dataloaders(test_low, crop_size=256, batch_size=1):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    test_loader = None
+
+    if test_low:
+        test_dataset = UnpairedDataset(test_low, transform=transform)
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+
+    return test_loader

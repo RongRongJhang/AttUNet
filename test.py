@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torchmetrics.functional import structural_similarity_index_measure
 from model import LaaFNet
-from dataloader import create_dataloaders
+from dataloader import create_dataloaders, create_unpaired_dataloaders
 import os
 import numpy as np
 from torchvision.utils import save_image
@@ -15,12 +15,20 @@ from measure_niqe_bris import metrics as metrics_niqu
 def validate(model, dataloader, device, result_dir):
     model.eval()
     with torch.no_grad():
-        for low, high, name in dataloader:
-            low, high = low.to(device), high.to(device)
+        # for low, high, name in dataloader:
+        #     low, high = low.to(device), high.to(device)
+        #     output = model(low)
+        #     output = torch.clamp(output, 0, 1)
+
+        #     filename = name[0] if not name[0].endswith('.png') else name[0]
+        #     save_path = os.path.join(result_dir, filename)
+        #     save_image(output, save_path)
+        for low, name in dataloader:
+            low = low.to(device)
             output = model(low)
             output = torch.clamp(output, 0, 1)
 
-            filename = name[0] if not name[0].endswith('.png') else name[0]
+            filename = name[0] if not name[0].endswith('.bmp') else name[0]
             save_path = os.path.join(result_dir, filename)
             save_image(output, save_path)
 
@@ -35,7 +43,7 @@ def main():
     # test_low = 'data/LOLv2/Synthetic/Test/Low'
     # test_high = 'data/LOLv2/Synthetic/Test/Normal'
 
-    test_low = 'data/LIME/*.bmp'
+    test_low = 'data/LIME'
 
     weights_path = '/content/drive/MyDrive/Att-UNet/best_model.pth'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -44,7 +52,7 @@ def main():
     result_dir = '/content/drive/MyDrive/Att-UNet/results/testing/output/'
 
     # _, test_loader = create_dataloaders(None, None, test_low, test_high, crop_size=None, batch_size=1)
-    test_loader = DataLoader(test_low, num_workers=4, batch_size=1, shuffle=False)
+    test_loader = create_unpaired_dataloaders(test_low, num_workers=4, batch_size=1, shuffle=False)
 
     print(f'Test loader: {len(test_loader)}')
 
